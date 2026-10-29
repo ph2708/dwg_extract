@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Extrator e Auditor Universal Multidisciplinar de Projetos CAD (DWG / DXF)
-Com Motor de Diagnóstico de Inconsistências Técnicas
+Com Motor de Diagnóstico de Inconsistências e Resolução Semântica de Blocos Anônimos
 """
 
 import os
@@ -30,8 +30,9 @@ DISCIPLINES_KEYWORDS = {
     ]
 }
 
+ANONYMOUS_PREFIXES = ("Z$W", "zw$", "A$C", "*U", "*D", "*X")
+
 def convert_dwg_to_dxf(dwg_path: str, dxf_path: str) -> tuple[bool, str]:
-    """Converte DWG para DXF via libredwg e captura avisos/erros do arquivo."""
     try:
         cmd = ["dwg2dxf", "-y", "-o", dxf_path, dwg_path]
         res = subprocess.run(cmd, capture_output=True, text=True)
@@ -71,6 +72,14 @@ def identify_element_discipline(name_or_layer: str) -> str:
             return disc
     return "GERAL"
 
+def clean_block_name(raw_name: str) -> str:
+    """Limpa sufixos de flats e cópias como -flat-1, -flat-2, etc."""
+    cleaned = re.sub(r"(-flat-\d+)+", "", raw_name)
+    return cleaned.strip()
+
+def is_anonymous_block(name: str) -> bool:
+    return any(name.startswith(p) for p in ANONYMOUS_PREFIXES)
+
 def extract_project_summary(file_path: str) -> dict:
     path = Path(file_path)
     dxf_path = str(file_path)
@@ -81,7 +90,7 @@ def extract_project_summary(file_path: str) -> dict:
         target_dxf = path.with_suffix(".temp.dxf")
         success, conversion_warnings = convert_dwg_to_dxf(str(path), str(target_dxf))
         if not success:
-            raise RuntimeError(f"Falha ao converter o arquivo DWG. O arquivo pode estar corrompido ou em formato incompatível.")
+            raise RuntimeError("Falha ao converter o arquivo DWG. O arquivo pode estar corrompido ou em formato incompatível.")
         dxf_path = str(target_dxf)
         temp_created = True
 
@@ -93,18 +102,17 @@ def extract_project_summary(file_path: str) -> dict:
             "arquivo": path.name,
             "extensao": path.suffix.lower(),
             "disciplinas_detectadas": set(),
-            "inconsistencias": [],              # Motor de Diagnóstico de Inconsistências
-            "elementos_pontuais": {},           # Peças / Pontos
-            "metragens_lineares_metros": {},     # Redes / Tubos / Eletrodutos
+            "inconsistencias": [],
+            "elementos_pontuais": {},
+            "metragens_lineares_metros": {},
             "tags_identificadores": [],
             "especificacoes_tecnicas": [],
             "notas_de_prancha": []
         }
 
         # ----------------------------------------------------
-        # 1. MOTOR DE DIAGNÓSTICO DE INCONSISTÊNCIAS TÉCNICAS
+        # 1. MOTOR DE DIAGNÓSTICO DE INCONSISTÊNCIAS
         # ----------------------------------------------------
-        # A) Inconsistência de conversão / integridade do DWG
         if "ERROR:" in conversion_warnings or "corrupted" in conversion_warnings.lower():
             summary["inconsistencias"].append({
                 "tipo": "INTEGRIDADE_CAD",
@@ -112,11 +120,7 @@ def extract_project_summary(file_path: str) -> dict:
                 "mensagem": "O arquivo DWG contém seções internas instáveis ou corrompidas (aviso do leitor de DWG). Algumas entidades podem ter sido ignoradas."
             })
 
-        # B) Inconsistência de Unidade do Desenho ($INSUNITS)
         insunits = doc.header.get("$INSUNITS", 0)
-        # 0 = Unspecified, 1 = Inches, 4 = Millimeters, 6 = Meters
-        unit_names = {0: "Não Especificada (Unitless)", 1: "Polegadas (Inches)", 4: "Milímetros", 6: "Metros"}
-        scale_unit_name = unit_names.get(insunits, f"Código {insunits}")
         if insunits == 0:
             summary["inconsistencias"].append({
                 "tipo": "ESCALA_UNIDADES",
@@ -124,7 +128,6 @@ def extract_project_summary(file_path: str) -> dict:
                 "mensagem": "O projeto está como 'Unitless' (sem unidade definida no cabeçalho). O extrator assumiu escala padrão em milímetros (mm). Valide a proporção das metragens."
             })
 
-        # C) Inconsistência de Coordenadas Perdidas / Elementos Fora de Escala (Extents anômalos)
         extreme_entities = 0
         for ent in msp:
             if ent.dxftype() == "INSERT":
@@ -138,13 +141,9 @@ def extract_project_summary(file_path: str) -> dict:
                 "mensagem": f"Foram detectados {extreme_entities} blocos/entidades com coordenadas astronômicas (> 10.000 km da origem). Indício de peças 'perdidas' ou cotas descoladas no CAD."
             })
 
-        # D) Entidades isoladas na Layer 0 ou Defpoints
         layer_entity_counts = Counter()
-        block_counts = Counter()
         for ent in msp:
             layer_entity_counts[ent.dxf.layer] += 1
-            if ent.dxftype() == "INSERT":
-                block_counts[(ent.dxf.layer, ent.dxf.name)] += 1
 
         ent_in_layer_zero = layer_entity_counts.get("0", 0)
         total_ents = sum(layer_entity_counts.values())
@@ -156,23 +155,101 @@ def extract_project_summary(file_path: str) -> dict:
             })
 
         # ----------------------------------------------------
-        # 2. ELEMENTOS PONTUAIS & METRAGENS
+        # 2. MAPEAMENTO ESPACIAL DE TEXTOS / TAGS PARA RESOLVER BLOCOS
         # ----------------------------------------------------
-        for (layer, bname), count in block_counts.items():
+        cad_texts = []
+        specs = set()
+        tags = set()
+        classes_pressao = set()
+
+        for ent in msp:
+            if ent.dxftype() in ("TEXT", "MTEXT"):
+                raw = ent.dxf.text if ent.dxftype() == "TEXT" else ent.text
+                txt = clean_cad_text(raw)
+                if not txt:
+                    continue
+                loc = getattr(ent.dxf, "insert", None)
+                if loc:
+                    cad_texts.append((loc.x, loc.y, txt, ent.dxf.layer))
+
+                upper = txt.upper()
+                if re.match(r"^[A-Z]{1,4}[-_]?[0-9]{1,3}[A-Z]?$", txt) or "SOBE PARA" in upper or "DESCE PARA" in upper:
+                    tags.add(f"[{ent.dxf.layer}] {txt}")
+
+                if any(w in upper for w in [
+                    "VALVULA", "VÁLVULA", "JUNTA", "FLANGE", "RETENÇÃO", "BOMBA", "Ø",
+                    "ANSI", "CLASSE", "PSI", "ASTM", "NBR", "SCH", "GPM",
+                    "CABO", "ELETRODUTO", "CIRCUITO", "DETECTOR", "TENSÃO", "KVA", "AMPERE", "DISJUNTOR"
+                ]):
+                    specs.add(txt)
+
+                if "150 PSI" in upper or "CLASSE 150" in upper:
+                    classes_pressao.add("150 psi")
+                if "300 PSI" in upper or "CLASSE 300" in upper:
+                    classes_pressao.add("300 psi")
+
+        if len(classes_pressao) > 1:
+            summary["inconsistencias"].append({
+                "tipo": "CONFLITO_PRESSAO",
+                "gravidade": "ALERTA TÉCNICO",
+                "mensagem": f"Classes de pressão mistas identificadas no mesmo projeto ({', '.join(classes_pressao)}). Exige verificação se os contraflanges e conexões de transição foram previstos."
+            })
+
+        def resolve_nearest_tag_or_label(x, y, layer, max_dist=2000):
+            """Encontra texto ou número de balão técnico mais próximo da inserção do bloco."""
+            best_dist = max_dist
+            best_label = None
+            for tx, ty, tval, tlayer in cad_texts:
+                d = ((tx-x)**2 + (ty-y)**2)**0.5
+                if d < best_dist:
+                    # Preferência por textos de tags curtas ou mesma layer
+                    if len(tval) < 25:
+                        best_dist = d
+                        best_label = tval
+            return best_label
+
+        # ----------------------------------------------------
+        # 3. CONTAGEM E RESOLUÇÃO INTELIGENTE DE ELEMENTOS PONTUAIS
+        # ----------------------------------------------------
+        block_counts = Counter()
+        for ins in msp.query("INSERT"):
+            layer = ins.dxf.layer
+            bname = clean_block_name(ins.dxf.name)
             disc = identify_element_discipline(layer + " " + bname)
+
             if disc != "GERAL":
                 summary["disciplinas_detectadas"].add(disc)
-                readable_label = f"[{layer}] {bname}"
-                summary["elementos_pontuais"][readable_label] = count
 
+                # Se for bloco com nome técnico legível (ex: CURVAS 90, PLANTA BOMBA)
+                if not is_anonymous_block(bname):
+                    label = f"[{layer}] {bname}"
+                else:
+                    # Bloco anônimo do ZWCAD/AutoCAD: resolver semanticamente
+                    loc = ins.dxf.insert
+                    near_tag = resolve_nearest_tag_or_label(loc.x, loc.y, layer)
+                    # Normalizar o nome da camada técnica
+                    layer_clean = layer.replace("_", " ").title()
+                    if near_tag:
+                        label = f"[{layer}] {layer_clean} (Item/Tag: {near_tag})"
+                    else:
+                        label = f"[{layer}] {layer_clean} (Bloco Técnico)"
+
+                block_counts[label] += 1
+
+        # Também contar camadas com entidades dedicadas (ex: SPRINKLERS, HIDRANTE)
         for layer, count in layer_entity_counts.items():
             disc = identify_element_discipline(layer)
             if disc != "GERAL" and count > 0:
                 summary["disciplinas_detectadas"].add(disc)
                 key = f"[LAYER] {layer}"
-                if key not in summary["elementos_pontuais"] and any(k in layer.upper() for k in ["HIDRANTE", "DETECTOR", "SPRINKLER", "QUADRO", "PAINEL", "LUMINARIA", "TOMADA"]):
-                    summary["elementos_pontuais"][key] = count
+                if key not in block_counts and any(k in layer.upper() for k in ["HIDRANTE", "DETECTOR", "SPRINKLER", "QUADRO", "PAINEL", "LUMINARIA", "TOMADA"]):
+                    block_counts[key] = count
 
+        summary["elementos_pontuais"] = dict(block_counts)
+
+        # ----------------------------------------------------
+        # 4. METRAGEM LINEAR POR LAYER
+        # ----------------------------------------------------
         layer_lengths = {}
         for line in msp.query("LINE"):
             length = (line.dxf.start - line.dxf.end).magnitude
@@ -190,50 +267,11 @@ def extract_project_summary(file_path: str) -> dict:
                 summary["disciplinas_detectadas"].add(disc)
                 summary["metragens_lineares_metros"][layer] = round(total_mm / 1000.0, 2)
 
-        # ----------------------------------------------------
-        # 3. TEXTOS, TAGS E ESPECIFICAÇÕES
-        # ----------------------------------------------------
-        tags = set()
-        specs = set()
-        classes_pressao = set()
-
-        for ent in msp:
-            if ent.dxftype() in ("TEXT", "MTEXT"):
-                raw = ent.dxf.text if ent.dxftype() == "TEXT" else ent.text
-                txt = clean_cad_text(raw)
-                if not txt:
-                    continue
-                upper = txt.upper()
-
-                if re.match(r"^[A-Z]{1,4}[-_]?[0-9]{1,3}[A-Z]?$", txt) or "SOBE PARA" in upper or "DESCE PARA" in upper:
-                    tags.add(f"[{ent.dxf.layer}] {txt}")
-
-                if any(w in upper for w in [
-                    "VALVULA", "VÁLVULA", "JUNTA", "FLANGE", "RETENÇÃO", "BOMBA", "Ø",
-                    "ANSI", "CLASSE", "PSI", "ASTM", "NBR", "SCH", "GPM",
-                    "CABO", "ELETRODUTO", "CIRCUITO", "DETECTOR", "TENSÃO", "KVA", "AMPERE", "DISJUNTOR"
-                ]):
-                    specs.add(txt)
-
-                # Coletar classes de pressão para checagem de conflito
-                if "150 PSI" in upper or "CLASSE 150" in upper:
-                    classes_pressao.add("150 psi")
-                if "300 PSI" in upper or "CLASSE 300" in upper:
-                    classes_pressao.add("300 psi")
-
-        # Inconsistência de Classes de Pressão Mistas
-        if len(classes_pressao) > 1:
-            summary["inconsistencias"].append({
-                "tipo": "CONFLITO_PRESSAO",
-                "gravidade": "ALERTA TÉCNICO",
-                "mensagem": f"Classes de pressão mistas identificadas no mesmo projeto ({', '.join(classes_pressao)}). Exige verificação se os contraflanges e conexões de transição foram previstos."
-            })
-
         summary["tags_identificadores"] = sorted(list(tags))[:40]
         summary["especificacoes_tecnicas"] = sorted(list(specs))
 
         # ----------------------------------------------------
-        # 4. NOTAS DE PRANCHA
+        # 5. NOTAS DE PRANCHA
         # ----------------------------------------------------
         notes = []
         for layout in doc.layouts:
@@ -264,13 +302,12 @@ def extract_project_summary(file_path: str) -> dict:
 def format_ai_prompt(data: dict) -> str:
     p = []
     p.append("="*80)
-    p.append(f"AUDITORIA TÉCNICA MULTIDISCIPLINAR DE PROJETO (IA READY)")
+    p.append("AUDITORIA TÉCNICA MULTIDISCIPLINAR DE PROJETO (IA READY)")
     p.append(f"Arquivo: {data['arquivo']}")
     disc_str = ", ".join(data['disciplinas_detectadas']) if data['disciplinas_detectadas'] else "Geral / Engenharia"
     p.append(f"Disciplinas: {disc_str}")
     p.append("="*80)
 
-    # Bloco destacado de Inconsistências
     p.append("\n[DIAGNÓSTICO AUTOMÁTICO DE INCONSISTÊNCIAS DO CAD]:")
     if data["inconsistencias"]:
         for inc in data["inconsistencias"]:
