@@ -40,11 +40,14 @@ async def api_extract(file: UploadFile = File(...)):
         try:
             summary = extract_project_summary(str(tmp_file))
             prompt_text = format_ai_prompt(summary)
+            from cad_to_ai import format_topology_text
+            topology_text = format_topology_text(summary)
             return {
                 "success": True,
                 "filename": file.filename,
                 "summary": summary,
-                "prompt_text": prompt_text
+                "prompt_text": prompt_text,
+                "topology_text": topology_text
             }
         except Exception as e:
             return JSONResponse(
