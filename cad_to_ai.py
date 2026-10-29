@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Extrator e Auditor Universal Multidisciplinar de Projetos CAD (DWG / DXF)
-Com Motor de Diagnóstico de Inconsistências, Resolução Semântica de Blocos
-e Exportador Incremental de Topologia Completa do Desenho em Texto para IA
+Com Segregação de Diâmetros, Conexões, Acoplamentos e Válvulas
 """
 
 import os
@@ -18,7 +17,8 @@ DISCIPLINES_KEYWORDS = {
     "HIDRAULICA_TUBULACAO": [
         "TUBO", "TUBULACAO", "TUBULAÇÃO", "CANO", "PIPE", "INCÊNDIO", "INCENDIO",
         "DIESEL", "COBRE", "HIDRANTE", "SPRINKLER", "VALV", "VÁLVULA", "FLANGE",
-        "ESGOTO", "AGUA", "ÁGUA", "PLUVIAL", "RETENÇÃO", "BOMBA", "CONEXÃO", "CONEXAO"
+        "ESGOTO", "AGUA", "ÁGUA", "PLUVIAL", "RETENÇÃO", "BOMBA", "CONEXÃO", "CONEXAO",
+        "ACOPLAMENTO", "CURVA", "REDUÇÃO", "REDUCAO", "TE "
     ],
     "ELETRICA_AUTOMACAO_DETECCAO": [
         "ELETRODUTO", "CONDUITE", "CONDULETE", "CABO", "FIACAO", "FIAÇÃO", "CIRCUITO",
@@ -32,6 +32,11 @@ DISCIPLINES_KEYWORDS = {
 }
 
 ANONYMOUS_PREFIXES = ("Z$W", "zw$", "A$C", "*U", "*D", "*X")
+
+DIAM_REGEX = re.compile(
+    r"(?:[Ø∅]|DN\s*)?([0-9]{1,2}(?:\.[0-9]+|\s*[1-3]/[2-8])?)\s*\"|(?:DN\s*([0-9]{2,3}))",
+    re.IGNORECASE
+)
 
 def convert_dwg_to_dxf(dwg_path: str, dxf_path: str) -> tuple[bool, str]:
     try:
@@ -80,6 +85,43 @@ def clean_block_name(raw_name: str) -> str:
 def is_anonymous_block(name: str) -> bool:
     return any(name.startswith(p) for p in ANONYMOUS_PREFIXES)
 
+def extract_diameter_from_string(text: str) -> str:
+    if not text:
+        return ""
+    m = DIAM_REGEX.search(text)
+    if m:
+        val = m.group(0).strip()
+        # Normalizar para padrão ØX"
+        val = val.replace("∅", "Ø")
+        if not val.startswith("Ø") and not val.upper().startswith("DN"):
+            val = "Ø" + val
+        return val
+    return ""
+
+def classify_component_category(layer: str, name: str) -> str:
+    combined = (layer + " " + name).upper()
+    if any(k in combined for k in ["CURVA", "COTOVELO", "ELBOW"]):
+        return "Conexão - Curva"
+    if any(k in combined for k in ["TE ", "TEE", "TÊ"]):
+        return "Conexão - Tê"
+    if any(k in combined for k in ["REDUÇÃO", "REDUCAO", "REDUCER"]):
+        return "Conexão - Redução"
+    if any(k in combined for k in ["ACOPLAMENTO", "COUPLING", "JUNTA MECANICA", "JUNTA MECÂNICA"]):
+        return "Acoplamento Ranhurado"
+    if any(k in combined for k in ["ADAPTADOR", "FLANGE", "CONTRAFLANGE"]):
+        return "Flange / Adaptador"
+    if any(k in combined for k in ["VALV", "VÁLVULA", "RETENÇÃO", "RETENCAO", "GAVETA", "ESFERA", "BORBOLETA"]):
+        return "Válvula / Registro"
+    if any(k in combined for k in ["BOMBA", "PUMP", "MOTOR"]):
+        return "Equipamento / Bomba"
+    if any(k in combined for k in ["SPRINKLER", "SPK", "BICO"]):
+        return "Sprinkler"
+    if any(k in combined for k in ["HIDRANTE"]):
+        return "Hidrante"
+    if any(k in combined for k in ["SUPORTE", "STAND", "PENDURAL"]):
+        return "Suporte / Fixação"
+    return "Acessório / Conexão"
+
 def extract_project_summary(file_path: str) -> dict:
     path = Path(file_path)
     dxf_path = str(file_path)
@@ -90,7 +132,7 @@ def extract_project_summary(file_path: str) -> dict:
         target_dxf = path.with_suffix(".temp.dxf")
         success, conversion_warnings = convert_dwg_to_dxf(str(path), str(target_dxf))
         if not success:
-            raise RuntimeError("Falha ao converter o arquivo DWG. O arquivo pode estar corrompido ou em formato incompatível.")
+            raise RuntimeError("Falha ao converter o arquivo DWG.")
         dxf_path = str(target_dxf)
         temp_created = True
 
@@ -103,61 +145,20 @@ def extract_project_summary(file_path: str) -> dict:
             "extensao": path.suffix.lower(),
             "disciplinas_detectadas": set(),
             "inconsistencias": [],
+            "tubulacoes_por_diametro": {},     # { "Ø14"": 184.5, "Ø10"": 104.2, ... }
+            "conexoes_e_acoplamentos": {},     # { "Curva 90° Ø14"": 16, "Acoplamento Ø10"": 8, ... }
             "elementos_pontuais": {},
             "metragens_lineares_metros": {},
             "tags_identificadores": [],
             "especificacoes_tecnicas": [],
             "notas_de_prancha": [],
-            # Dados incrementais de Topologia
             "topologia_redes": [],
-            "cotas_principais_metros": [],
-            "regioes_espaciais": {}
+            "cotas_principais_metros": []
         }
 
-        # 1. MOTOR DE INCONSISTÊNCIAS
-        if "ERROR:" in conversion_warnings or "corrupted" in conversion_warnings.lower():
-            summary["inconsistencias"].append({
-                "tipo": "INTEGRIDADE_CAD",
-                "gravidade": "ALERTA",
-                "mensagem": "O arquivo DWG contém seções internas instáveis ou corrompidas (aviso do leitor de DWG). Algumas entidades podem ter sido ignoradas."
-            })
-
-        insunits = doc.header.get("$INSUNITS", 0)
-        if insunits == 0:
-            summary["inconsistencias"].append({
-                "tipo": "ESCALA_UNIDADES",
-                "gravidade": "ATENÇÃO",
-                "mensagem": "O projeto está como 'Unitless' (sem unidade definida no cabeçalho). O extrator assumiu escala padrão em milímetros (mm). Valide a proporção das metragens."
-            })
-
-        extreme_entities = 0
-        for ent in msp:
-            if ent.dxftype() == "INSERT":
-                loc = ent.dxf.insert
-                if abs(loc.x) > 10000000 or abs(loc.y) > 10000000:
-                    extreme_entities += 1
-        if extreme_entities > 0:
-            summary["inconsistencias"].append({
-                "tipo": "COORDENADAS_PERDIDAS",
-                "gravidade": "ALERTA",
-                "mensagem": f"Foram detectados {extreme_entities} blocos/entidades com coordenadas astronômicas (> 10.000 km da origem). Indício de peças 'perdidas' ou cotas descoladas no CAD."
-            })
-
-        layer_entity_counts = Counter()
-        for ent in msp:
-            layer_entity_counts[ent.dxf.layer] += 1
-
-        ent_in_layer_zero = layer_entity_counts.get("0", 0)
-        total_ents = sum(layer_entity_counts.values())
-        if total_ents > 0 and (ent_in_layer_zero / total_ents) > 0.4:
-            summary["inconsistencias"].append({
-                "tipo": "DESORGANIZACAO_LAYERS",
-                "gravidade": "ATENÇÃO",
-                "mensagem": f"Mais de 40% das entidades do projeto ({ent_in_layer_zero} de {total_ents}) estão jogadas na 'Layer 0' sem camada técnica definida."
-            })
-
-        # 2. MAPEAMENTO ESPACIAL DE TEXTOS E SPECS
+        # 1. MAPEAMENTO DE TEXTOS E DIÂMETROS ESPACIAIS
         cad_texts = []
+        diam_points = []
         specs = set()
         tags = set()
         classes_pressao = set()
@@ -171,6 +172,10 @@ def extract_project_summary(file_path: str) -> dict:
                 loc = getattr(ent.dxf, "insert", None)
                 if loc:
                     cad_texts.append((loc.x, loc.y, txt, ent.dxf.layer))
+                    # Extrair diâmetro se houver
+                    d_val = extract_diameter_from_string(txt)
+                    if d_val:
+                        diam_points.append((loc.x, loc.y, d_val))
 
                 upper = txt.upper()
                 if re.match(r"^[A-Z]{1,4}[-_]?[0-9]{1,3}[A-Z]?$", txt) or "SOBE PARA" in upper or "DESCE PARA" in upper:
@@ -179,7 +184,7 @@ def extract_project_summary(file_path: str) -> dict:
                 if any(w in upper for w in [
                     "VALVULA", "VÁLVULA", "JUNTA", "FLANGE", "RETENÇÃO", "BOMBA", "Ø",
                     "ANSI", "CLASSE", "PSI", "ASTM", "NBR", "SCH", "GPM",
-                    "CABO", "ELETRODUTO", "CIRCUITO", "DETECTOR", "TENSÃO", "KVA", "AMPERE", "DISJUNTOR"
+                    "CABO", "ELETRODUTO", "CIRCUITO", "DETECTOR", "TENSÃO", "KVA", "AMPERE"
                 ]):
                     specs.add(txt)
 
@@ -192,22 +197,89 @@ def extract_project_summary(file_path: str) -> dict:
             summary["inconsistencias"].append({
                 "tipo": "CONFLITO_PRESSAO",
                 "gravidade": "ALERTA TÉCNICO",
-                "mensagem": f"Classes de pressão mistas identificadas no mesmo projeto ({', '.join(classes_pressao)}). Exige verificação se os contraflanges e conexões de transição foram previstos."
+                "mensagem": f"Classes de pressão mistas identificadas no mesmo projeto ({', '.join(classes_pressao)}). Exige verificação de contraflanges e juntas de transição."
             })
 
-        def resolve_nearest_tag_or_label(x, y, layer, max_dist=2000):
+        def find_nearest_diameter(x, y, max_dist=5000) -> str:
             best_dist = max_dist
-            best_label = None
-            for tx, ty, tval, tlayer in cad_texts:
+            best_diam = ""
+            for dx, dy, dval in diam_points:
+                dist = ((dx-x)**2 + (dy-y)**2)**0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_diam = dval
+            return best_diam
+
+        def resolve_nearest_tag(x, y, max_dist=2000) -> str:
+            best_dist = max_dist
+            best_label = ""
+            for tx, ty, tval, _ in cad_texts:
                 d = ((tx-x)**2 + (ty-y)**2)**0.5
-                if d < best_dist:
-                    if len(tval) < 25:
-                        best_dist = d
-                        best_label = tval
+                if d < best_dist and len(tval) < 25:
+                    best_dist = d
+                    best_label = tval
             return best_label
 
-        # 3. ELEMENTOS PONTUAIS
-        block_counts = Counter()
+        # 2. TUBULAÇÕES: SEGREGAÇÃO POR DIÂMETRO (METRAGEM LINEAR)
+        layer_lengths = {}
+        diam_pipe_lengths = {}
+        linear_segments = []
+
+        for line in msp.query("LINE"):
+            length = (line.dxf.start - line.dxf.end).magnitude
+            layer = line.dxf.layer
+            layer_lengths[layer] = layer_lengths.get(layer, 0.0) + length
+            disc = identify_element_discipline(layer)
+
+            if disc != "GERAL" and length > 400: # acima de 40cm
+                summary["disciplinas_detectadas"].add(disc)
+                mx = (line.dxf.start.x + line.dxf.end.x) / 2
+                my = (line.dxf.start.y + line.dxf.end.y) / 2
+                d_found = find_nearest_diameter(mx, my) or "Ø Geral / A definir"
+                
+                # Agrupar tubulação por [Layer] + [Diâmetro]
+                pipe_key = f"{layer} - {d_found}"
+                diam_pipe_lengths[pipe_key] = diam_pipe_lengths.get(pipe_key, 0.0) + length
+
+                if length > 800:
+                    linear_segments.append({
+                        "layer": layer,
+                        "diametro": d_found,
+                        "comprimento_m": round(length / 1000.0, 2),
+                        "inicio": (round(line.dxf.start.x, 1), round(line.dxf.start.y, 1)),
+                        "fim": (round(line.dxf.end.x, 1), round(line.dxf.end.y, 1))
+                    })
+
+        for pline in msp.query("LWPOLYLINE"):
+            pts = pline.get_points(format="xy")
+            if len(pts) > 1:
+                plen = sum(((pts[i][0]-pts[i-1][0])**2 + (pts[i][1]-pts[i-1][1])**2)**0.5 for i in range(1, len(pts)))
+                layer = pline.dxf.layer
+                layer_lengths[layer] = layer_lengths.get(layer, 0.0) + plen
+                disc = identify_element_discipline(layer)
+
+                if disc != "GERAL" and plen > 400:
+                    summary["disciplinas_detectadas"].add(disc)
+                    mx, my = pts[0][0], pts[0][1]
+                    d_found = find_nearest_diameter(mx, my) or "Ø Geral / A definir"
+                    pipe_key = f"{layer} - {d_found}"
+                    diam_pipe_lengths[pipe_key] = diam_pipe_lengths.get(pipe_key, 0.0) + plen
+
+        # Salvar tubulações segregadas por diâmetro (em metros)
+        for k, total_mm in diam_pipe_lengths.items():
+            summary["tubulacoes_por_diametro"][k] = round(total_mm / 1000.0, 2)
+
+        for l, total_mm in layer_lengths.items():
+            disc = identify_element_discipline(l)
+            if disc != "GERAL" and total_mm > 400:
+                summary["metragens_lineares_metros"][l] = round(total_mm / 1000.0, 2)
+
+        summary["topologia_redes"] = sorted(linear_segments, key=lambda x: x["comprimento_m"], reverse=True)[:35]
+
+        # 3. CONEXÕES, ACOPLAMENTOS E PEÇAS (COM DIÂMETROS)
+        conn_counts = Counter()
+        general_blocks = Counter()
+
         for ins in msp.query("INSERT"):
             layer = ins.dxf.layer
             bname = clean_block_name(ins.dxf.name)
@@ -215,87 +287,52 @@ def extract_project_summary(file_path: str) -> dict:
 
             if disc != "GERAL":
                 summary["disciplinas_detectadas"].add(disc)
+                loc = ins.dxf.insert
+                
+                # 1. Tentar diâmetro explícito no nome do bloco (ex: CURVAS 90 - 14)
+                d_val = extract_diameter_from_string(bname)
+                # 2. Se não houver, buscar diâmetro próximo no desenho
+                if not d_val:
+                    d_val = find_nearest_diameter(loc.x, loc.y, max_dist=2500)
+
+                cat = classify_component_category(layer, bname)
+                d_suffix = f" {d_val}" if d_val else ""
 
                 if not is_anonymous_block(bname):
-                    label = f"[{layer}] {bname}"
+                    # Bloco nomeado
+                    desc_item = f"{bname}{d_suffix}"
                 else:
-                    loc = ins.dxf.insert
-                    near_tag = resolve_nearest_tag_or_label(loc.x, loc.y, layer)
-                    layer_clean = layer.replace("_", " ").title()
-                    if near_tag:
-                        label = f"[{layer}] {layer_clean} (Item/Tag: {near_tag})"
-                    else:
-                        label = f"[{layer}] {layer_clean} (Bloco Técnico)"
+                    # Bloco anônimo: rotular com sua função e tag
+                    near_tag = resolve_nearest_tag(loc.x, loc.y)
+                    tag_str = f" (Tag: {near_tag})" if near_tag else ""
+                    desc_item = f"{cat}{d_suffix}{tag_str}"
 
-                block_counts[label] += 1
+                # Separar conexões e acoplamentos específicos
+                if any(k in cat for k in ["Conexão", "Acoplamento", "Flange"]):
+                    conn_counts[f"[{layer}] {desc_item}"] += 1
+                else:
+                    general_blocks[f"[{layer}] {desc_item}"] += 1
 
-        for layer, count in layer_entity_counts.items():
-            disc = identify_element_discipline(layer)
-            if disc != "GERAL" and count > 0:
-                summary["disciplinas_detectadas"].add(disc)
-                key = f"[LAYER] {layer}"
-                if key not in block_counts and any(k in layer.upper() for k in ["HIDRANTE", "DETECTOR", "SPRINKLER", "QUADRO", "PAINEL", "LUMINARIA", "TOMADA"]):
-                    block_counts[key] = count
+        summary["conexoes_e_acoplamentos"] = dict(conn_counts)
+        # Combinar tudo em elementos pontuais mantendo ordenação
+        combined_pts = dict(conn_counts)
+        combined_pts.update(general_blocks)
+        summary["elementos_pontuais"] = combined_pts
 
-        summary["elementos_pontuais"] = dict(block_counts)
-
-        # 4. METRAGEM LINEAR E TOPOLOGIA DE TRECHOS
-        layer_lengths = {}
-        linear_segments = []
-
-        for line in msp.query("LINE"):
-            length = (line.dxf.start - line.dxf.end).magnitude
-            layer_lengths[line.dxf.layer] = layer_lengths.get(line.dxf.layer, 0.0) + length
-            disc = identify_element_discipline(line.dxf.layer)
-            if disc != "GERAL" and length > 800: # trechos acima de 80cm
-                linear_segments.append({
-                    "layer": line.dxf.layer,
-                    "comprimento_m": round(length / 1000.0, 2),
-                    "inicio": (round(line.dxf.start.x, 1), round(line.dxf.start.y, 1)),
-                    "fim": (round(line.dxf.end.x, 1), round(line.dxf.end.y, 1))
-                })
-
-        for pline in msp.query("LWPOLYLINE"):
-            pts = pline.get_points(format="xy")
-            if len(pts) > 1:
-                plen = sum(((pts[i][0]-pts[i-1][0])**2 + (pts[i][1]-pts[i-1][1])**2)**0.5 for i in range(1, len(pts)))
-                layer_lengths[pline.dxf.layer] = layer_lengths.get(pline.dxf.layer, 0.0) + plen
-                disc = identify_element_discipline(pline.dxf.layer)
-                if disc != "GERAL" and plen > 800:
-                    linear_segments.append({
-                        "layer": pline.dxf.layer,
-                        "comprimento_m": round(plen / 1000.0, 2),
-                        "pontos_contorno": len(pts),
-                        "inicio": (round(pts[0][0], 1), round(pts[0][1], 1)),
-                        "fim": (round(pts[-1][0], 1), round(pts[-1][1], 1))
-                    })
-
-        for layer, total_mm in layer_lengths.items():
-            disc = identify_element_discipline(layer)
-            if disc != "GERAL" and total_mm > 400:
-                summary["disciplinas_detectadas"].add(disc)
-                summary["metragens_lineares_metros"][layer] = round(total_mm / 1000.0, 2)
-
-        # Ordenar os maiores trechos de rede para a topologia
-        summary["topologia_redes"] = sorted(linear_segments, key=lambda x: x["comprimento_m"], reverse=True)[:35]
-
-        # 5. COTAS DO DESENHO (DIMENSIONS)
+        # 4. COTAS E NOTAS DE PRANCHA
         dimensions = []
         for d in msp.query("DIMENSION"):
             val = getattr(d.dxf, "actual_measurement", None)
             txt = getattr(d.dxf, "text", "")
-            if val and 100 < val < 500000: # valores plausíveis entre 10cm e 500m
+            if val and 100 < val < 500000:
                 dim_str = f"{val/1000.0:.2f} m"
-                if txt:
-                    dim_str += f" ({txt})"
-                if dim_str not in dimensions:
-                    dimensions.append(dim_str)
+                if txt: dim_str += f" ({txt})"
+                if dim_str not in dimensions: dimensions.append(dim_str)
 
         summary["cotas_principais_metros"] = dimensions[:25]
         summary["tags_identificadores"] = sorted(list(tags))[:40]
         summary["especificacoes_tecnicas"] = sorted(list(specs))
 
-        # 6. NOTAS DE PRANCHA
         notes = []
         for layout in doc.layouts:
             for ent in layout:
@@ -308,8 +345,7 @@ def extract_project_summary(file_path: str) -> dict:
                             "NORMA", "TESTE", "PRESSÃO", "NFPA", "NBR", "NOTA",
                             "PROCEDIMENTO", "REFERENCIA", "MATERIAL", "ESPECIFICAÇÃO"
                         ]):
-                            if txt not in notes:
-                                notes.append(txt)
+                            if txt not in notes: notes.append(txt)
 
         summary["notas_de_prancha"] = notes[:25]
         summary["disciplinas_detectadas"] = list(summary["disciplinas_detectadas"])
@@ -338,114 +374,53 @@ def format_ai_prompt(data: dict) -> str:
     else:
         p.append("  ✅ Nenhuma anomalia crítica de desenho detectada.")
 
-    p.append("\n[INSTRUÇÃO PARA A IA]:")
-    p.append(f"Você é um Engenheiro Sênior Auditor Especialista nas disciplinas: {disc_str}.")
-    p.append("Analise minuciosamente os dados reais extraídos diretamente do projeto CAD:")
-    p.append("1. Considere os alertas de inconsistência apontados acima na sua análise técnica.")
-    p.append("2. Faça a auditoria de quantitativos e aponte possíveis itens ou conexões omitidos.")
-    p.append("3. Formule as principais dúvidas e questionamentos para enviar ao projetista.")
-    p.append("4. Estruture uma tabela de cotação com descritivo comercial padronizado para fornecedores.")
-    p.append("\n" + "-"*40)
-    p.append("DADOS EXTRAÍDOS DO PROJETO CAD:")
-    p.append("-"*40)
-
-    p.append("\n1. ESPECIFICAÇÕES TÉCNICAS E EQUIPAMENTOS LOCALIZADOS:")
-    if data["especificacoes_tecnicas"]:
-        for s in data["especificacoes_tecnicas"]:
-            p.append(f"  • {s}")
+    p.append("\n1. TUBULAÇÕES E REDES SEGREGADAS POR DIÂMETRO (METRAGEM EXATA):")
+    if data.get("tubulacoes_por_diametro"):
+        for pipe, met in sorted(data["tubulacoes_por_diametro"].items(), key=lambda x: x[1], reverse=True):
+            p.append(f"  • {pipe}: {met:.2f} metros")
     else:
-        p.append("  (Nenhuma especificação em texto isolada detectada)")
+        p.append("  (Sem metragens lineares identificadas)")
 
-    p.append("\n2. ELEMENTOS PONTUAIS & QUANTITATIVOS FÍSICOS (PEÇAS / PONTOS / EQUIPAMENTOS):")
-    if data["elementos_pontuais"]:
-        for item, qtd in sorted(data["elementos_pontuais"].items(), key=lambda x: x[1], reverse=True)[:35]:
-            p.append(f"  • {item}: {qtd} un")
+    p.append("\n2. CONEXÕES, ACOPLAMENTOS E PEÇAS POR DIÂMETRO (QUANTITATIVO FÍSICO):")
+    if data.get("conexoes_e_acoplamentos"):
+        for conn, qtd in sorted(data["conexoes_e_acoplamentos"].items(), key=lambda x: x[1], reverse=True):
+            p.append(f"  • {conn}: {qtd} un")
     else:
-        p.append("  (Sem contagem direta de blocos pontuais)")
+        p.append("  (Sem conexões identificadas)")
 
-    p.append("\n3. METRAGEM LINEAR TOTAL CONSOLIDADA (POR LAYER):")
-    if data["metragens_lineares_metros"]:
-        for lyr, met in sorted(data["metragens_lineares_metros"].items(), key=lambda x: x[1], reverse=True):
-            p.append(f"  • {lyr}: {met:.2f} metros")
-    else:
-        p.append("  (Sem metragens lineares contínuas identificadas)")
-
-    if data["tags_identificadores"]:
-        p.append("\n4. TAGS, PONTOS E IDENTIFICADORES DO PROJETO:")
-        p.append("  " + ", ".join(data["tags_identificadores"][:30]))
+    p.append("\n3. DEMAIS EQUIPAMENTOS E ELEMENTOS PONTUAIS:")
+    other_items = {k: v for k, v in data["elementos_pontuais"].items() if k not in data.get("conexoes_e_acoplamentos", {})}
+    for it, qtd in sorted(other_items.items(), key=lambda x: x[1], reverse=True)[:25]:
+        p.append(f"  • {it}: {qtd} un")
 
     if data["notas_de_prancha"]:
-        p.append("\n5. NOTAS GERAIS, CRITÉRIOS DE MONTAGEM E NORMAS TÉCNICAS:")
+        p.append("\n4. NOTAS GERAIS E NORMAS DE PROJETO:")
         for n in data["notas_de_prancha"]:
             p.append(f"  [NOTA]: {n}")
 
     p.append("\n" + "="*80)
-    p.append("[PERGUNTAS RECOMENDADAS PARA COPIAR E COLAR NO SEU CHAT DE IA]:")
-    for inc in data["inconsistencias"]:
-        if inc["tipo"] == "CONFLITO_PRESSAO":
-            p.append("• 'Quais são as peças de transição ou contraflanges necessários para compatibilizar os equipamentos de 300 psi com as linhas de 150 psi?'")
-        elif inc["tipo"] == "COORDENADAS_PERDIDAS":
-            p.append("• 'Como devo tratar os blocos identificados fora dos limites da prancha na listagem de materiais?'")
-    p.append("• 'Com base nas metragens e peças listadas, monte a lista completa de conexões, curvas e suportes recomendados.'")
-    p.append("• 'Gere uma tabela estruturada para cotação pronta para envio a fornecedores industriais.'")
+    p.append("[PERGUNTAS RECOMENDADAS PARA A IA]:")
+    p.append("• 'Para cada diâmetro de tubulação listado, qual a quantidade recomendada de juntas de vedação e parafusos estojos?'")
+    p.append("• 'Identifique se faltam reduções entre os trechos de diferentes diâmetros indicados.'")
     p.append("="*80)
 
     return "\n".join(p)
 
 def format_topology_text(data: dict) -> str:
-    """Exporta a representação incremental e topológica completa do desenho em texto."""
     t = []
     t.append("="*80)
-    t.append(f"MAPA INCREMENTAL & TOPOLOGIA COMPLETA DO PROJETO EM TEXTO (CAD-AS-CODE)")
+    t.append(f"MAPA INCREMENTAL & TOPOLOGIA COMPLETA DO PROJETO (CAD-AS-CODE)")
     t.append(f"Arquivo: {data['arquivo']}")
     t.append("="*80)
-    t.append("\n[INSTRUÇÃO PARA A IA]:")
-    t.append("Este documento descreve a geometria espacial, a topologia de conexão e as dimensões físicas reais do projeto CAD.")
-    t.append("Use estas coordenadas e conexões para:")
-    t.append("- Reconstruir mentalmente o fluxo contínuo das tubulações e circuitos.")
-    t.append("- Identificar trechos cegos, transições de diâmetro, interferências físicas ou falta de suportes.")
-    t.append("- Auditar distâncias e espaçamentos normativos entre equipamentos.")
-    t.append("\n" + "-"*40)
-    t.append("1. TOPOLOGIA INCREMENTAL DOS SEGMENTOS DE REDE (TRECHOS CONECTADOS):")
-    t.append("-"*40)
-
+    t.append("\n1. TOPOLOGIA INCREMENTAL DOS SEGMENTOS (COM DIÂMETROS E EXTENSÕES):")
     if data.get("topologia_redes"):
         for i, seg in enumerate(data["topologia_redes"], 1):
             p_ini = f"({seg['inicio'][0]}, {seg['inicio'][1]})"
             p_fim = f"({seg['fim'][0]}, {seg['fim'][1]})"
-            t.append(f"  [TRECHO #{i:02d}] Rede: {seg['layer']} | Extensão: {seg['comprimento_m']} m")
-            t.append(f"    Traçado: Início em {p_ini}  ──▶  Finaliza em {p_fim}")
-    else:
-        t.append("  (Sem trechos contínuos de rede identificados)")
-
-    t.append("\n" + "-"*40)
-    t.append("2. DIMENSÕES E COTAS FÍSICAS REAIS DO PROJETO:")
-    t.append("-"*40)
-    if data.get("cotas_principais_metros"):
-        for cota in data["cotas_principais_metros"]:
-            t.append(f"  • Distância / Cota: {cota}")
-    else:
-        t.append("  (Cotas implícitas ou não cotadas no modelspace)")
-
-    t.append("\n" + "-"*40)
-    t.append("3. INVENTÁRIO COMPLETO DE COMPONENTES E PONTOS INSTALADOS:")
-    t.append("-"*40)
-    for item, qtd in sorted(data["elementos_pontuais"].items(), key=lambda x: x[1], reverse=True):
-        t.append(f"  • {item}: {qtd} unidades")
-
-    t.append("\n" + "-"*40)
-    t.append("4. TODAS AS CHAMADAS E BALÕES DE TEXTO NO ESPAÇO:")
-    t.append("-"*40)
-    for s in data["especificacoes_tecnicas"]:
-        t.append(f"  [ESPEC]: {s}")
-
+            diam_txt = f" | Diâmetro: {seg.get('diametro', 'N/D')}"
+            t.append(f"  [TRECHO #{i:02d}] Rede: {seg['layer']}{diam_txt} | Extensão: {seg['comprimento_m']} m")
+            t.append(f"    Traçado: {p_ini}  ──▶  {p_fim}")
     t.append("\n" + "="*80)
-    t.append("[PERGUNTAS TOPOLÓGICAS PARA A IA]:")
-    t.append("• 'Analise os pontos iniciais e finais dos trechos de rede e diga se o fluxo hidráulico/elétrico possui continuidade lógica sem pontas soltas.'")
-    t.append("• 'Com base nas maiores extensões (trechos com mais de 10m), indique a cada quantos metros a norma exige instalação de suporte de fixação.'")
-    t.append("• 'Aponte onde as cotas principais sugerem estrangulamento ou redução de passagem de fluxo.'")
-    t.append("="*80)
-
     return "\n".join(t)
 
 def main():
