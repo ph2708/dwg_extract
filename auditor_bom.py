@@ -267,7 +267,7 @@ def generate_budget_excel(cad_summary: dict, audit_results: list[dict] = None) -
 
         ws1.cell(row=curr_row, column=1, value=item_idx).alignment = Alignment(horizontal="center")
         ws1.cell(row=curr_row, column=2, value="Tubulação")
-        ws1.cell(row=curr_row, column=3, value=f"Tubo para {rede}")
+        ws1.cell(row=curr_row, column=3, value=rede)
         ws1.cell(row=curr_row, column=4, value=diam).alignment = Alignment(horizontal="center")
         c_qtd = ws1.cell(row=curr_row, column=5, value=metros)
         c_qtd.number_format = '#,##0.00'
@@ -281,58 +281,59 @@ def generate_budget_excel(cad_summary: dict, audit_results: list[dict] = None) -
         curr_row += 1
         item_idx += 1
 
-    # 2. Conexões e Acoplamentos
-    for key, qtd in sorted(cad_summary.get("conexoes_e_acoplamentos", {}).items(), key=lambda x: x[1], reverse=True):
-        desc_clean = re.sub(r"^\[.*?\]\s*", "", key)
-        # Extrair diâmetro se houver
+    # 2. Consolidação de Conexões, Válvulas, Equipamentos e Suportes (Sem Duplicatas)
+    comp_map = {}
+    for key, qtd in cad_summary.get("elementos_pontuais", {}).items():
+        m_cat = re.match(r"^\[(.*?)\]\s*(.*)$", key)
+        if m_cat:
+            cat = m_cat.group(1).strip()
+            desc_clean = m_cat.group(2).strip()
+        else:
+            cat = "Outro Componente"
+            desc_clean = key.strip()
+
+        # Extrai diâmetro nominal da descrição se houver
         m_diam = re.search(r"Ø[0-9]{1,2}(?:\.[0-9]+|\s*[1-3]/[2-8])?\"?", desc_clean)
         diam_val = m_diam.group(0) if m_diam else "-"
 
-        tag_match = re.search(r"\(Tag:\s*(.*?)\)", key)
-        tag_val = tag_match.group(1) if tag_match else "-"
+        # Chave única para agregação
+        group_key = (cat, desc_clean, diam_val)
+        if group_key not in comp_map:
+            comp_map[group_key] = {
+                "categoria": cat,
+                "descricao": desc_clean,
+                "diametro": diam_val,
+                "quantidade": 0,
+                "unidade": "un",
+                "tag": "-"
+            }
+        comp_map[group_key]["quantidade"] += qtd
 
+    def cat_priority(c):
+        if "Conexão" in c or "Acoplamento" in c or "Flange" in c or "Junta" in c: return 1
+        if "Válvula" in c or "Registro" in c: return 2
+        if "Bomba" in c or "Equipamento" in c: return 3
+        if "Suporte" in c: return 4
+        return 5
+
+    sorted_comps = sorted(comp_map.values(), key=lambda x: (cat_priority(x["categoria"]), -x["quantidade"]))
+
+    for comp in sorted_comps:
         ws1.cell(row=curr_row, column=1, value=item_idx).alignment = Alignment(horizontal="center")
-        ws1.cell(row=curr_row, column=2, value="Conexão / Acoplamento")
-        ws1.cell(row=curr_row, column=3, value=desc_clean)
-        ws1.cell(row=curr_row, column=4, value=diam_val).alignment = Alignment(horizontal="center")
-        c_qtd = ws1.cell(row=curr_row, column=5, value=qtd)
+        ws1.cell(row=curr_row, column=2, value=comp["categoria"])
+        ws1.cell(row=curr_row, column=3, value=comp["descricao"])
+        ws1.cell(row=curr_row, column=4, value=comp["diametro"]).alignment = Alignment(horizontal="center")
+        c_qtd = ws1.cell(row=curr_row, column=5, value=comp["quantidade"])
         c_qtd.number_format = '#,##0'
         c_qtd.alignment = Alignment(horizontal="right")
-        ws1.cell(row=curr_row, column=6, value="un").alignment = Alignment(horizontal="center")
-        ws1.cell(row=curr_row, column=7, value=tag_val).alignment = Alignment(horizontal="center")
+        ws1.cell(row=curr_row, column=6, value=comp["unidade"]).alignment = Alignment(horizontal="center")
+        ws1.cell(row=curr_row, column=7, value=comp["tag"]).alignment = Alignment(horizontal="center")
 
         for c in range(1, 8):
             ws1.cell(row=curr_row, column=c).border = thin_border
             if item_idx % 2 == 0: ws1.cell(row=curr_row, column=c).fill = zebra_fill
         curr_row += 1
         item_idx += 1
-
-    # 3. Demais Elementos (Válvulas / Equipamentos)
-    conns_set = set(cad_summary.get("conexoes_e_acoplamentos", {}).keys())
-    for key, qtd in sorted(cad_summary.get("elementos_pontuais", {}).items(), key=lambda x: x[1], reverse=True):
-        if key not in conns_set:
-            desc_clean = re.sub(r"^\[.*?\]\s*", "", key)
-            m_diam = re.search(r"Ø[0-9]{1,2}(?:\.[0-9]+|\s*[1-3]/[2-8])?\"?", desc_clean)
-            diam_val = m_diam.group(0) if m_diam else "-"
-
-            tag_match = re.search(r"\(Tag:\s*(.*?)\)", key)
-            tag_val = tag_match.group(1) if tag_match else "-"
-
-            ws1.cell(row=curr_row, column=1, value=item_idx).alignment = Alignment(horizontal="center")
-            ws1.cell(row=curr_row, column=2, value="Válvula / Equipamento")
-            ws1.cell(row=curr_row, column=3, value=desc_clean)
-            ws1.cell(row=curr_row, column=4, value=diam_val).alignment = Alignment(horizontal="center")
-            c_qtd = ws1.cell(row=curr_row, column=5, value=qtd)
-            c_qtd.number_format = '#,##0'
-            c_qtd.alignment = Alignment(horizontal="right")
-            ws1.cell(row=curr_row, column=6, value="un").alignment = Alignment(horizontal="center")
-            ws1.cell(row=curr_row, column=7, value=tag_val).alignment = Alignment(horizontal="center")
-
-            for c in range(1, 8):
-                ws1.cell(row=curr_row, column=c).border = thin_border
-                if item_idx % 2 == 0: ws1.cell(row=curr_row, column=c).fill = zebra_fill
-            curr_row += 1
-            item_idx += 1
 
     # ----------------------------------------------------
     # ABA 2: MATRIZ DE COTAÇÃO DE FORNECEDORES

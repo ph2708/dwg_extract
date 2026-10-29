@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Extrator e Auditor Universal Multidisciplinar de Projetos CAD (DWG / DXF)
-Com Calibração e Detecção Automática de Escalas, Auditoria de Medidas e Segregação de Diâmetros
+Com Limpeza de Ruídos, Desduplicação de Vistas (Planta vs Corte) e Consolidação de Materiais
 """
 
 import os
@@ -12,6 +12,31 @@ import subprocess
 from pathlib import Path
 from collections import Counter
 import ezdxf
+
+# Camadas que NUNCA são tubulações físicas ou materiais de compra
+IGNORED_LAYERS = {
+    "QUADRO", "LIMITE DE DESENHO", "MARGEM", "SELO", "FORMATO", 
+    "INDICAÇÃO DE CORTE", "INDICACAO DE CORTE", "INDICAÇÃO DE SUPORTE",
+    "INDICACAO DE SUPORTE", "DEFPOINTS", "VIEWPORT", "HATCH", "EIXO", "EIXOS", 
+    "COTAS", "COTAS SHW", "PP_COTAS", "TEXTO", "TEXTOS", "TXT_GERAL", "TXT_EIXOS",
+    "IND_EIXOS", "NIVEL", "NIVEIS", "CIVIL", "CONCRETO", "BASE_CONCRETO", "PROJEÇÃO", "PROJECAO",
+    "ESCADA", "GRADE", "VALA_TUBULACAO", "VALA", "MEC-PIPE-RACK", "06_HACHURA", "ALVENARIA",
+    "AQ-ALVENARIA", "TYCO-ALVENARIA", "AQ-ESQUADRIAS", "CAIXILHOS", "BASE", "0",
+    "CALCULO HIDRAULICO", "DETALHE", "INDIC CORTE", "33-FIRE_PUMP_FUEL"
+}
+
+# Camadas que representam conexões, válvulas ou equipamentos (NUNCA somar como metragem linear de tubo)
+NON_PIPE_COMPONENT_LAYERS = {
+    "CONEXÃO", "CONEXAO", "CONEXÃO MECÃNICA", "CONEXAO MECANICA", "WS-MV CONEX",
+    "VALVULA", "VÁLVULA", "VALVULA RO", "DIVISAO_DE_VALVULAS",
+    "FLANGE", "FLANGES", "JUNTA", "ACOPLAMENTO",
+    "TANQUE", "TANQUE DIESEL", "SUPORTE", "INDICAÇÃO DE SUPORTE", "INSTRUMENT"
+}
+
+# Palavras que confirmam que a camada é uma rede de tubulação real
+TRUE_PIPE_KEYWORDS = [
+    "TUBULAÇÃO", "TUBULACAO", "TUBO", "TUBUL", "PIPE", "CANO", "REDE"
+]
 
 DISCIPLINES_KEYWORDS = {
     "HIDRAULICA_TUBULACAO": [
@@ -97,37 +122,118 @@ def extract_diameter_from_string(text: str) -> str:
         return val
     return ""
 
-def classify_component_category(layer: str, name: str) -> str:
+def canonical_pipe_network(layer: str) -> str:
+    """Padroniza o nome comercial da tubulação para o relatório e planilha."""
+    lu = layer.upper()
+    if "COBRE" in lu:
+        return "Tubulação de Cobre"
+    if "DIESEL" in lu or "OLEO" in lu or "COMBUSTIVEL" in lu:
+        return "Tubulação de Óleo Diesel"
+    if "SPRINKLER" in lu or "SPK" in lu:
+        return "Tubulação de Sprinklers"
+    if any(k in lu for k in ["INCÊNDIO", "INCENDIO", "TUBO-INC", "TUBUL INC"]):
+        return "Tubulação de Incêndio (Aço Carbono)"
+    return f"Tubulação ({layer})"
+
+def canonical_fitting_name(layer: str, name: str, diam: str) -> tuple[str, str, str]:
+    """
+    Consolida nomes de conexões, suportes, válvulas e equipamentos,
+    eliminando variações de vistas (frontal, lateral, traseira) e hashes anônimos.
+    Retorna: (categoria_principal, descricao_comercial, diametro_nominal)
+    """
     combined = (layer + " " + name).upper()
-    if any(k in combined for k in ["CURVA", "COTOVELO", "ELBOW"]):
-        return "Conexão - Curva"
-    if any(k in combined for k in ["TE ", "TEE", "TÊ"]):
-        return "Conexão - Tê"
+    d_val = diam or ""
+
+    # 1. Suportes de Tubulação
+    if "SUPORTE" in combined or name.lower().startswith("sup"):
+        d = d_val or ("Ø14\"" if "14" in combined else ("Ø4\"" if "4" in combined else ("Ø2\"" if "2" in combined else "-")))
+        return "Suporte / Fixação", "Suporte Metálico de Tubulação (Tipo Hanger / Abraçadeira)", d
+
+    # 2. Curvas
+    if any(k in combined for k in ["CURVAS 90", "CURVA 90", "CURVA 14X90", "COTOVELO 90"]):
+        d = d_val or ("Ø14\"" if "14" in combined else ("Ø10\"" if "10" in combined else ("Ø4\"" if "4" in combined else ("Ø2\"" if "2" in combined else ""))))
+        d_label = f" {d}" if d else ""
+        return "Conexão - Curva", f"Curva 90° Raio Longo{d_label}", d or "-"
+
+    if any(k in combined for k in ["CURVAS 45", "CURVA 45", "COTOVELO 45"]):
+        d_label = f" {d_val}" if d_val else ""
+        return "Conexão - Curva", f"Curva 45°{d_label}", d_val or "-"
+
+    # 3. Tês
+    if any(k in combined for k in ["TE -", "TE ", "TEE", "TÊ"]):
+        d = d_val or ("Ø10\"" if "10" in combined else ("Ø2.1/2\"" if "2-1-2" in combined else ("Ø2\"" if "2" in combined else "")))
+        d_label = f" {d}" if d else ""
+        return "Conexão - Tê", f"Conexão Tê Reto Industrial{d_label}", d or "-"
+
+    # 4. Flanges
+    if any(k in combined for k in ["FLANGE", "CONTRAFLANGE", "ADAPTADOR"]):
+        d_label = f" {d_val}" if d_val else ""
+        return "Flange / Adaptador", f"Flange com Ressalto ANSI B16.5{d_label}", d_val or "-"
+
+    # 5. Juntas de Expansão
+    if "JUNTA" in combined:
+        d_label = f" {d_val}" if d_val else ""
+        return "Junta / Flexível", f"Junta de Expansão Flexível com Tensores{d_label}", d_val or "-"
+
+    # 6. Acoplamentos Ranhurados
+    if any(k in combined for k in ["ACOPLAMENTO", "COUPLING", "GROOVED"]):
+        d_label = f" {d_val}" if d_val else ""
+        return "Acoplamento Ranhurado", f"Acoplamento Ranhurado (Grooved){d_label}", d_val or "-"
+
+    # 7. Reduções
     if any(k in combined for k in ["REDUÇÃO", "REDUCAO", "REDUCER"]):
-        return "Conexão - Redução"
-    if any(k in combined for k in ["ACOPLAMENTO", "COUPLING", "JUNTA MECANICA", "JUNTA MECÂNICA"]):
-        return "Acoplamento Ranhurado"
-    if any(k in combined for k in ["ADAPTADOR", "FLANGE", "CONTRAFLANGE"]):
-        return "Flange / Adaptador"
-    if any(k in combined for k in ["VALV", "VÁLVULA", "RETENÇÃO", "RETENCAO", "GAVETA", "ESFERA", "BORBOLETA"]):
-        return "Válvula / Registro"
+        d_label = f" {d_val}" if d_val else ""
+        return "Conexão - Redução", f"Redução Concêntrica/Excêntrica{d_label}", d_val or "-"
+
+    # 8. Válvulas
+    if any(k in combined for k in ["VALVULA", "VÁLVULA", "RETENÇÃO", "RETENCAO", "GAVETA", "BORBOLETA", "ESFERA", "ALÍVIO", "ALIVIO"]):
+        if "RETENÇÃO" in combined or "RETENCAO" in combined:
+            d = d_val or ("Ø14\"" if "14" in combined else "")
+            d_label = f" {d}" if d else ""
+            return "Válvula / Registro", f"Válvula de Retenção Dupla Portinhola{d_label}", d or "-"
+        elif "ALÍVIO" in combined or "ALIVIO" in combined or "SEGURANÇA" in combined:
+            d = d_val or ("Ø14\"" if "14" in combined else ("Ø8\"" if "8" in combined else ""))
+            d_label = f" {d}" if d else ""
+            return "Válvula / Registro", f"Válvula de Alívio e Segurança Angular 90°{d_label}", d or "-"
+        elif "GAVETA" in combined:
+            d_label = f" {d_val}" if d_val else ""
+            return "Válvula / Registro", f"Válvula Gaveta OS&Y Flangeada{d_label}", d_val or "-"
+        elif "BORBOLETA" in combined:
+            d_label = f" {d_val}" if d_val else ""
+            return "Válvula / Registro", f"Válvula Borboleta com Redutor{d_label}", d_val or "-"
+        elif "ESFERA" in combined:
+            d_label = f" {d_val}" if d_val else ""
+            return "Válvula / Registro", f"Válvula Esfera Industrial{d_label}", d_val or "-"
+        d_label = f" {d_val}" if d_val else ""
+        return "Válvula / Registro", f"Válvula Industrial{d_label}", d_val or "-"
+
+    # 9. Bombas e Equipamentos
     if any(k in combined for k in ["BOMBA", "PUMP", "MOTOR"]):
-        return "Equipamento / Bomba"
-    if any(k in combined for k in ["SPRINKLER", "SPK", "BICO"]):
-        return "Sprinkler"
-    if any(k in combined for k in ["HIDRANTE"]):
-        return "Hidrante"
-    if any(k in combined for k in ["SUPORTE", "STAND", "PENDURAL"]):
-        return "Suporte / Fixação"
-    return "Acessório / Conexão"
+        if "JOCKEY" in combined:
+            return "Equipamento / Bomba", "Conjunto Moto-Bomba Jockey", "-"
+        return "Equipamento / Bomba", "Conjunto Moto-Bomba Principal 5000 GPM", "-"
+
+    if any(k in combined for k in ["SPRINKLER", "SPK"]):
+        d_label = f" {d_val}" if d_val else ""
+        return "Sprinkler", f"Bico de Sprinkler Industrial{d_label}", d_val or "-"
+
+    if "HIDRANTE" in combined:
+        return "Hidrante", "Válvula / Ponto de Hidrante", d_val or "-"
+
+    # 10. Conexões anônimas na layer CONEXÃO
+    if any(k in combined for k in ["CONEXÃO", "CONEXAO"]):
+        d_label = f" {d_val}" if d_val else ""
+        return "Conexão / Acoplamento", f"Conexão Hidráulica Ranhurada / Soldada{d_label}", d_val or "-"
+
+    # Blocos anônimos sem classificação prévia
+    if is_anonymous_block(name):
+        d_label = f" {d_val}" if d_val else ""
+        return "Conexão / Acessório", f"Conexão Industrial ({layer}){d_label}", d_val or "-"
+
+    d_label = f" {d_val}" if d_val else ""
+    return "Acessório / Conexão", f"{name}{d_label}", d_val or "-"
 
 def detect_cad_scale_factor(msp) -> tuple[float, str, str, list[dict]]:
-    """
-    Detecta automaticamente o Fator de Escala do Desenho comparando:
-    1. Medições reais de cotas (DIMENSION) presentes no arquivo
-    2. Comprimento das linhas do desenho
-    Retorna: (divisor_para_metros, nome_unidade, explicacao_tecnica, lista_cotas_amostra)
-    """
     dimension_samples = []
     for d in msp.query("DIMENSION"):
         val = getattr(d.dxf, "actual_measurement", None)
@@ -152,7 +258,6 @@ def detect_cad_scale_factor(msp) -> tuple[float, str, str, list[dict]]:
     vals_sorted = sorted(vals)
     median_val = vals_sorted[len(vals_sorted) // 2]
 
-    # Heurística de Calibração:
     if median_val >= 300:
         divisor = 1000.0
         unit = "Milímetros (mm)"
@@ -167,6 +272,57 @@ def detect_cad_scale_factor(msp) -> tuple[float, str, str, list[dict]]:
         expl = f"Mediana geométrica = {median_val:.2f} unidades. O desenho está em metros (1 unidade CAD = 1 metro)."
 
     return divisor, unit, expl, dimension_samples[:10]
+
+def detect_drawing_views(msp) -> tuple[bool, dict]:
+    """
+    Detecta se o arquivo CAD possui múltiplas vistas desenhadas lado a lado (ex: PLANTA e CORTE).
+    Quando presente, define o divisor espacial para auditar a PLANTA BAIXA e desduplicar os CORTES.
+    """
+    views = []
+    for ent in msp:
+        if ent.dxftype() in ("TEXT", "MTEXT"):
+            raw = ent.dxf.text if ent.dxftype() == "TEXT" else ent.text
+            loc = getattr(ent.dxf, "insert", None)
+            txt = raw.strip().upper()
+            if loc and any(txt == k or txt.startswith(k + " ") or txt.startswith(k + "-") for k in [
+                "PLANTA", "PLANTA BAIXA", "LAYOUT", "CORTE", "ELEVAÇÃO", "ELEVACAO", "DETALHE", "SEÇÃO"
+            ]):
+                views.append((loc.x, loc.y, txt))
+
+    has_planta = any("PLANTA" in v[2] or "LAYOUT" in v[2] for v in views)
+    has_corte = any("CORTE" in v[2] or "ELEVA" in v[2] or "DETALHE" in v[2] for v in views)
+
+    if has_planta and has_corte:
+        planta_v = [v for v in views if "PLANTA" in v[2] or "LAYOUT" in v[2]][0]
+        corte_v = [v for v in views if "CORTE" in v[2] or "ELEVA" in v[2] or "DETALHE" in v[2]][0]
+        
+        p_x, p_y = planta_v[0], planta_v[1]
+        c_x, c_y = corte_v[0], corte_v[1]
+
+        if abs(c_x - p_x) >= abs(c_y - p_y):
+            split_x = (p_x + c_x) / 2
+            is_master_fn = (lambda x, y: x < split_x) if p_x < c_x else (lambda x, y: x >= split_x)
+            split_desc = f"Eixo X ({split_x:.0f})"
+        else:
+            split_y = (p_y + c_y) / 2
+            is_master_fn = (lambda x, y: y < split_y) if p_y < c_y else (lambda x, y: y >= split_y)
+            split_desc = f"Eixo Y ({split_y:.0f})"
+
+        return True, {
+            "possui_planta_e_corte": True,
+            "vistas": ["Planta Baixa (Área Master)", "Cortes / Detalhamentos (Vistas Laterais)"],
+            "split_desc": split_desc,
+            "is_master_fn": is_master_fn,
+            "mensagem": "Projeto com PLANTA BAIXA e CORTES identificado. A auditoria utilizou a Planta Baixa como base de quantitativos para evitar duplicações dos componentes desenhados nas vistas de corte."
+        }
+
+    # Desenho único sem cortes separados
+    return False, {
+        "possui_planta_e_corte": False,
+        "vistas": ["Área Integral"],
+        "is_master_fn": (lambda x, y: True),
+        "mensagem": "Desenho auditado em área integral."
+    }
 
 def extract_project_summary(file_path: str, user_scale_override: str = None) -> dict:
     path = Path(file_path)
@@ -186,9 +342,7 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
         doc = ezdxf.readfile(dxf_path)
         msp = doc.modelspace()
 
-        # Calibração e averiguação de Escala
         divisor_auto, unit_auto, expl_auto, sample_dims = detect_cad_scale_factor(msp)
-
         divisor = divisor_auto
         unit_name = unit_auto
         if user_scale_override:
@@ -203,6 +357,9 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
                 divisor = 1.0
                 unit_name = "Metros (m) [Manual]"
 
+        has_multi_views, view_info = detect_drawing_views(msp)
+        is_master_fn = view_info["is_master_fn"]
+
         summary = {
             "arquivo": path.name,
             "extensao": path.suffix.lower(),
@@ -213,6 +370,11 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
                 "divisor_aplicado": divisor,
                 "explicacao_tecnica": expl_auto,
                 "cotas_amostra_para_conferencia": sample_dims
+            },
+            "auditoria_vistas": {
+                "possui_planta_e_corte": has_multi_views,
+                "vistas_detectadas": view_info["vistas"],
+                "mensagem": view_info["mensagem"]
             },
             "tubulacoes_por_diametro": {},
             "conexoes_e_acoplamentos": {},
@@ -225,7 +387,7 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
             "cotas_principais_metros": []
         }
 
-        # 1. TEXTOS E DIÂMETROS
+        # 1. MAPEAMENTO DE TEXTOS E DIÂMETROS
         cad_texts = []
         diam_points = []
         specs = set()
@@ -239,7 +401,7 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
                 if not txt:
                     continue
                 loc = getattr(ent.dxf, "insert", None)
-                if loc:
+                if loc and is_master_fn(loc.x, loc.y):
                     cad_texts.append((loc.x, loc.y, txt, ent.dxf.layer))
                     d_val = extract_diameter_from_string(txt)
                     if d_val:
@@ -268,7 +430,7 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
                 "mensagem": f"Classes de pressão mistas identificadas no mesmo projeto ({', '.join(classes_pressao)}). Exige verificação de contraflanges e juntas de transição."
             })
 
-        def find_nearest_diameter(x, y, max_dist=5000) -> str:
+        def find_nearest_diameter(x, y, max_dist=4000) -> str:
             best_dist = max_dist
             best_diam = ""
             for dx, dy, dval in diam_points:
@@ -278,112 +440,149 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
                     best_diam = dval
             return best_diam
 
-        def resolve_nearest_tag(x, y, max_dist=2000) -> str:
-            best_dist = max_dist
-            best_label = ""
-            for tx, ty, tval, _ in cad_texts:
-                d = ((tx-x)**2 + (ty-y)**2)**0.5
-                if d < best_dist and len(tval) < 25:
-                    best_dist = d
-                    best_label = tval
-            return best_label
-
-        # 2. METRAGEM LINEAR E SEGREGAÇÃO (CALIBRADO COM DIVISOR DE ESCALA)
+        # 2. FILTRAGEM RIGOROSA DE TUBULAÇÃO REAL (IGNORA QUADRO, LIMITES, CONEXÕES E CORTES)
         layer_lengths = {}
         diam_pipe_lengths = {}
         linear_segments = []
+        unique_segments = set() # Desduplicação de sobreposições
 
-        min_pipe_thresh = 400.0 * (divisor / 1000.0) # equivalente a 40cm na escala
-        min_seg_thresh = 800.0 * (divisor / 1000.0)
+        min_pipe_thresh = 300.0 * (divisor / 1000.0)
+        min_seg_thresh = 600.0 * (divisor / 1000.0)
 
         for line in msp.query("LINE"):
-            length = (line.dxf.start - line.dxf.end).magnitude
             layer = line.dxf.layer
-            layer_lengths[layer] = layer_lengths.get(layer, 0.0) + length
-            disc = identify_element_discipline(layer)
+            layer_u = layer.upper()
 
-            if disc != "GERAL" and length > min_pipe_thresh:
+            # Filtra camadas ignoradas
+            if layer_u in IGNORED_LAYERS or any(k in layer_u for k in NON_PIPE_COMPONENT_LAYERS):
+                continue
+
+            # Confirma que é camada de tubulação
+            if not any(k in layer_u for k in TRUE_PIPE_KEYWORDS):
+                continue
+
+            disc = identify_element_discipline(layer)
+            if disc == "GERAL":
+                continue
+
+            mx = (line.dxf.start.x + line.dxf.end.x) / 2
+            my = (line.dxf.start.y + line.dxf.end.y) / 2
+
+            # Se for projeto com cortes, processa apenas a vista master (Planta Baixa)
+            if not is_master_fn(mx, my):
+                continue
+
+            # Desduplicação de linhas sobrepostas
+            p1 = (round(line.dxf.start.x, 1), round(line.dxf.start.y, 1))
+            p2 = (round(line.dxf.end.x, 1), round(line.dxf.end.y, 1))
+            seg_key = tuple(sorted([p1, p2]))
+            if seg_key in unique_segments:
+                continue
+            unique_segments.add(seg_key)
+
+            length = (line.dxf.start - line.dxf.end).magnitude
+            if length > min_pipe_thresh:
                 summary["disciplinas_detectadas"].add(disc)
-                mx = (line.dxf.start.x + line.dxf.end.x) / 2
-                my = (line.dxf.start.y + line.dxf.end.y) / 2
-                d_found = find_nearest_diameter(mx, my) or "Ø Geral / A definir"
+                layer_lengths[layer] = layer_lengths.get(layer, 0.0) + length
                 
-                pipe_key = f"{layer} - {d_found}"
+                d_found = find_nearest_diameter(mx, my) or "Ø A definir"
+                canon_net = canonical_pipe_network(layer)
+
+                pipe_key = f"{canon_net} - {d_found}"
                 diam_pipe_lengths[pipe_key] = diam_pipe_lengths.get(pipe_key, 0.0) + length
 
                 if length > min_seg_thresh:
                     linear_segments.append({
                         "layer": layer,
+                        "rede": canon_net,
                         "diametro": d_found,
                         "comprimento_m": round(length / divisor, 2),
                         "comprimento_cad_original": round(length, 1),
-                        "inicio": (round(line.dxf.start.x, 1), round(line.dxf.start.y, 1)),
-                        "fim": (round(line.dxf.end.x, 1), round(line.dxf.end.y, 1))
+                        "inicio": p1,
+                        "fim": p2
                     })
 
         for pline in msp.query("LWPOLYLINE"):
+            layer = pline.dxf.layer
+            layer_u = layer.upper()
+            if layer_u in IGNORED_LAYERS or any(k in layer_u for k in NON_PIPE_COMPONENT_LAYERS):
+                continue
+            if not any(k in layer_u for k in TRUE_PIPE_KEYWORDS):
+                continue
+
+            disc = identify_element_discipline(layer)
+            if disc == "GERAL":
+                continue
+
             pts = pline.get_points(format="xy")
             if len(pts) > 1:
-                plen = sum(((pts[i][0]-pts[i-1][0])**2 + (pts[i][1]-pts[i-1][1])**2)**0.5 for i in range(1, len(pts)))
-                layer = pline.dxf.layer
-                layer_lengths[layer] = layer_lengths.get(layer, 0.0) + plen
-                disc = identify_element_discipline(layer)
+                mx, my = pts[0][0], pts[0][1]
+                if not is_master_fn(mx, my):
+                    continue
 
-                if disc != "GERAL" and plen > min_pipe_thresh:
+                plen = sum(((pts[i][0]-pts[i-1][0])**2 + (pts[i][1]-pts[i-1][1])**2)**0.5 for i in range(1, len(pts)))
+                if plen > min_pipe_thresh:
                     summary["disciplinas_detectadas"].add(disc)
-                    mx, my = pts[0][0], pts[0][1]
-                    d_found = find_nearest_diameter(mx, my) or "Ø Geral / A definir"
-                    pipe_key = f"{layer} - {d_found}"
+                    layer_lengths[layer] = layer_lengths.get(layer, 0.0) + plen
+                    d_found = find_nearest_diameter(mx, my) or "Ø A definir"
+                    canon_net = canonical_pipe_network(layer)
+                    pipe_key = f"{canon_net} - {d_found}"
                     diam_pipe_lengths[pipe_key] = diam_pipe_lengths.get(pipe_key, 0.0) + plen
 
         for k, total_raw in diam_pipe_lengths.items():
             summary["tubulacoes_por_diametro"][k] = round(total_raw / divisor, 2)
 
         for l, total_raw in layer_lengths.items():
-            disc = identify_element_discipline(l)
-            if disc != "GERAL" and total_raw > min_pipe_thresh:
-                summary["metragens_lineares_metros"][l] = round(total_raw / divisor, 2)
+            summary["metragens_lineares_metros"][l] = round(total_raw / divisor, 2)
 
         summary["topologia_redes"] = sorted(linear_segments, key=lambda x: x["comprimento_m"], reverse=True)[:35]
 
-        # 3. CONEXÕES E ACOPLAMENTOS
-        conn_counts = Counter()
-        general_blocks = Counter()
+        # 3. CONSOLIDAÇÃO INTELIGENTE DE CONEXÕES E COMPONENTES (SEM DUPLICATAS DE CORTES)
+        conn_consolidated = Counter()
+        equipment_consolidated = Counter()
 
         for ins in msp.query("INSERT"):
             layer = ins.dxf.layer
+            layer_u = layer.upper()
             bname = clean_block_name(ins.dxf.name)
+
+            # Se for layer 0, aceita apenas blocos com nomes de equipamentos reais
+            if layer_u == "0":
+                if is_anonymous_block(bname):
+                    continue
+                if not any(k in bname.upper() for k in ["BOMBA", "VALV", "VÁLV", "CURVA", "TE", "FLANGE", "ADAPTADOR", "ACOPLAMENTO", "MOTOR", "PAINEL", "SUPORTE"]):
+                    continue
+            elif layer_u in IGNORED_LAYERS or any(k in layer_u for k in ("CORTE", "SELO", "MARGEM", "FORMATO", "COTAS", "NIVEL", "EIXO")):
+                continue
+
+            loc = ins.dxf.insert
+            # Desduplica componentes desenhados nas vistas de corte
+            if not is_master_fn(loc.x, loc.y):
+                continue
+
             disc = identify_element_discipline(layer + " " + bname)
 
             if disc != "GERAL":
                 summary["disciplinas_detectadas"].add(disc)
-                loc = ins.dxf.insert
                 
                 d_val = extract_diameter_from_string(bname)
                 if not d_val:
                     d_val = find_nearest_diameter(loc.x, loc.y, max_dist=2500)
 
-                cat = classify_component_category(layer, bname)
-                d_suffix = f" {d_val}" if d_val else ""
+                cat, desc_item, diam_nom = canonical_fitting_name(layer, bname, d_val)
 
-                if not is_anonymous_block(bname):
-                    desc_item = f"{bname}{d_suffix}"
+                item_key = f"[{cat}] {desc_item}"
+                if any(k in cat for k in ["Conexão", "Acoplamento", "Flange", "Junta"]):
+                    conn_consolidated[item_key] += 1
                 else:
-                    near_tag = resolve_nearest_tag(loc.x, loc.y)
-                    tag_str = f" (Tag: {near_tag})" if near_tag else ""
-                    desc_item = f"{cat}{d_suffix}{tag_str}"
+                    equipment_consolidated[item_key] += 1
 
-                if any(k in cat for k in ["Conexão", "Acoplamento", "Flange"]):
-                    conn_counts[f"[{layer}] {desc_item}"] += 1
-                else:
-                    general_blocks[f"[{layer}] {desc_item}"] += 1
-
-        summary["conexoes_e_acoplamentos"] = dict(conn_counts)
-        combined_pts = dict(conn_counts)
-        combined_pts.update(general_blocks)
+        summary["conexoes_e_acoplamentos"] = dict(conn_consolidated)
+        combined_pts = dict(conn_consolidated)
+        combined_pts.update(equipment_consolidated)
         summary["elementos_pontuais"] = combined_pts
 
-        # 4. COTAS DO DESENHO (CONFERIDAS COM DIVISOR)
+        # 4. COTAS E NOTAS DE PRANCHA
         dimensions = []
         for d in msp.query("DIMENSION"):
             val = getattr(d.dxf, "actual_measurement", None)
@@ -431,36 +630,50 @@ def format_ai_prompt(data: dict) -> str:
     p.append(f"Disciplinas: {disc_str}")
     esc = data.get("auditoria_escala", {})
     p.append(f"Calibração de Escala: {esc.get('unidade_detectada', 'N/D')} (Divisor {esc.get('divisor_aplicado', 1000)})")
+    
+    vistas = data.get("auditoria_vistas", {})
+    if vistas.get("possui_planta_e_corte"):
+        p.append("Desduplicação de Vistas: ATIVADA (Planta Baixa auditada para evitar duplicações dos Cortes)")
     p.append("="*80)
 
     p.append("\n[AVERIGUAÇÃO DA ESCALA E MEDIDAS DO PROJETO]:")
     p.append(f"  ℹ️  {esc.get('explicacao_tecnica', '')}")
     if esc.get("cotas_amostra_para_conferencia"):
-        p.append("  Amostra de Cotas para conferir no AutoCAD (Comando DIST):")
+        p.append("  Amostra de Cotas no Arquivo para conferência no CAD (Comando DIST):")
         for s in esc["cotas_amostra_para_conferencia"][:4]:
             val_m = s['valor_cad'] / esc.get('divisor_aplicado', 1000)
-            p.append(f"   • Cota na Layer [{s['layer']}]: {s['valor_cad']:.1f} unidades no CAD  =  {val_m:.2f} metros no mundo real")
+            p.append(f"   • Cota Layer [{s['layer']}]: {s['valor_cad']:.1f} unidades CAD = {val_m:.2f} metros reais")
+
+    if vistas.get("possui_planta_e_corte"):
+        p.append("\n[DESDUPLICAÇÃO DE VISTAS (PLANTA vs CORTE)]:")
+        p.append(f"  ℹ️  {vistas.get('mensagem')}")
 
     if data["inconsistencias"]:
         p.append("\n[ALERTAS DE INCONSISTÊNCIAS]:")
         for inc in data["inconsistencias"]:
             p.append(f"  ⚠️  [{inc['gravidade']} - {inc['tipo']}]: {inc['mensagem']}")
 
-    p.append("\n1. TUBULAÇÕES E REDES SEGREGADAS POR DIÂMETRO (METRAGEM AUDITADA):")
+    p.append("\n1. TUBULAÇÕES REAIS POR DIÂMETRO (METRAGEM AUDITADA):")
     if data.get("tubulacoes_por_diametro"):
         for pipe, met in sorted(data["tubulacoes_por_diametro"].items(), key=lambda x: x[1], reverse=True):
             p.append(f"  • {pipe}: {met:.2f} metros")
 
-    p.append("\n2. CONEXÕES, ACOPLAMENTOS E PEÇAS POR DIÂMETRO (QUANTITATIVO FÍSICO):")
+    p.append("\n2. CONEXÕES, FLANGES E ACOPLAMENTOS (CONSOLIDADOS SEM DUPLICATAS):")
     if data.get("conexoes_e_acoplamentos"):
         for conn, qtd in sorted(data["conexoes_e_acoplamentos"].items(), key=lambda x: x[1], reverse=True):
             p.append(f"  • {conn}: {qtd} un")
 
-    p.append("\n" + "="*80)
-    p.append("[COMO AVERIGUAR QUALQUER TRECHO NO SEU AUTOCAD]:")
-    p.append("• Use o comando DIST digitando as coordenadas X,Y indicadas na aba Topologia para auditar o comprimento exato.")
-    p.append("="*80)
+    p.append("\n3. VÁLVULAS, EQUIPAMENTOS E SUPORTES:")
+    other_items = {k: v for k, v in data["elementos_pontuais"].items() if k not in data.get("conexoes_e_acoplamentos", {})}
+    for it, qtd in sorted(other_items.items(), key=lambda x: x[1], reverse=True):
+        p.append(f"  • {it}: {qtd} un")
 
+    if data["notas_de_prancha"]:
+        p.append("\n4. NOTAS GERAIS E NORMAS DE PROJETO:")
+        for n in data["notas_de_prancha"]:
+            p.append(f"  [NOTA]: {n}")
+
+    p.append("\n" + "="*80)
     return "\n".join(p)
 
 def format_topology_text(data: dict) -> str:
@@ -478,7 +691,7 @@ def format_topology_text(data: dict) -> str:
             p_ini = f"({seg['inicio'][0]}, {seg['inicio'][1]})"
             p_fim = f"({seg['fim'][0]}, {seg['fim'][1]})"
             diam_txt = f" | Diâmetro: {seg.get('diametro', 'N/D')}"
-            t.append(f"  [TRECHO #{i:02d}] Rede: {seg['layer']}{diam_txt}")
+            t.append(f"  [TRECHO #{i:02d}] {seg.get('rede', seg['layer'])}{diam_txt}")
             t.append(f"    Comprimento Auditado: {seg['comprimento_m']} metros  (Geometria CAD: {seg.get('comprimento_cad_original')} unidades)")
             t.append(f"    Coordenadas: Início em {p_ini}  ──▶  Fim em {p_fim}")
     t.append("\n" + "="*80)

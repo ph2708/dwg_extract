@@ -468,6 +468,14 @@
         <div id="scaleAuditText" style="font-size: 0.88rem; color: #e2e8f0; line-height: 1.5;"></div>
       </div>
 
+      <!-- Banner de Desduplicação de Vistas (Planta vs Corte) -->
+      <div id="viewAuditCard" style="display: none; background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 16px; padding: 18px 22px; margin-bottom: 20px;">
+        <div style="font-weight: 700; color: #34d399; display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+          <span>🔍</span> <span>Auditoria e Desduplicação de Vistas (Planta vs Corte)</span>
+        </div>
+        <div id="viewAuditText" style="font-size: 0.88rem; color: #e2e8f0; line-height: 1.5;"></div>
+      </div>
+
       <!-- Banner de Inconsistências -->
       <div id="diagnosticsCard" class="diagnostics-card" style="display: none;">
         <div class="diagnostics-title">
@@ -626,6 +634,15 @@
           scaleHtml += `</div>`;
         }
         document.getElementById('scaleAuditText').innerHTML = scaleHtml;
+
+        // Exibir Desduplicação de Vistas
+        const vistas = data.summary.auditoria_vistas || {};
+        if (vistas.possui_planta_e_corte) {
+          document.getElementById('viewAuditCard').style.display = 'block';
+          document.getElementById('viewAuditText').innerHTML = `<strong>Vistas Detectadas:</strong> ${vistas.vistas_detectadas.join(' • ')}<br><span style="color: #cbd5e1;">${vistas.mensagem}</span>`;
+        } else {
+          document.getElementById('viewAuditCard').style.display = 'none';
+        }
 
         currentPromptSummary = data.prompt_text;
         currentPromptTopology = data.topology_text || '';
