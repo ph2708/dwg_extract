@@ -1,0 +1,22 @@
+# Ambientes e cache
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Arquivos pesados do projeto (DWG de teste, backups, temporários)
+*.dwg
+*.dxf
+*.bak
+*.pdf
+*.zip
+*.temp.dxf
+relatorio_prompt_ia.txt
+casa_bombas.dxf
+
+# Mac OS
+.DS_Store
+
+# Pastas de dados brutos locais
+Projetos/
+chaves/
