@@ -1,28 +1,43 @@
-FROM ubuntu:24.04
+FROM python:3.11-slim AS builder
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Instala libredwg dos repositórios oficiais do Ubuntu 24.04 + Python 3
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libredwg-tools \
-    libredwg0t64 \
-    python3 \
-    python3-pip \
-    python3-venv \
+    build-essential \
+    git \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    texinfo \
     ca-certificates \
+    python3 \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+WORKDIR /src
+RUN git clone --depth 1 https://github.com/LibreDWG/libredwg.git . && \
+    sh autogen.sh && \
+    ./configure --disable-bindings --prefix=/usr/local && \
+    make -j$(nproc) && \
+    make install
 
-# Configura ambiente virtual Python isolado
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# Runtime stage leve
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1
+
+# Copia os binários compilados do libredwg
+COPY --from=builder /usr/local/bin/dwg* /usr/local/bin/
+COPY --from=builder /usr/local/lib/libredwg* /usr/local/lib/
+COPY --from=builder /usr/local/include/dwg* /usr/local/include/
+RUN ldconfig
+
+WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia código da aplicação
 COPY . .
 
 EXPOSE 8000
