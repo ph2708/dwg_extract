@@ -425,6 +425,25 @@
       </div>
     </div>
 
+    <!-- Opções de Calibração de Escala -->
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 14px 20px; margin-bottom: 24px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span style="font-size: 1.1rem;">📐</span>
+        <div>
+          <div style="font-weight: 700; font-size: 0.9rem;">Calibração de Escala & Unidade do Desenho:</div>
+          <div style="font-size: 0.8rem; color: var(--text-muted);">Detecta automaticamente contra as cotas do projeto ou permite forçar a unidade</div>
+        </div>
+      </div>
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <select id="scaleSelect" style="background: rgba(0,0,0,0.5); border: 1px solid var(--border); color: #fff; padding: 8px 14px; border-radius: 10px; font-size: 0.88rem; outline: none;">
+          <option value="auto">Detecção Automática (Recomendado)</option>
+          <option value="mm">Milímetros (1 unidade CAD = 1 mm)</option>
+          <option value="m">Metros (1 unidade CAD = 1 metro)</option>
+          <option value="cm">Centímetros (1 unidade CAD = 1 cm)</option>
+        </select>
+      </div>
+    </div>
+
     <!-- Botão de Processar -->
     <div class="action-bar">
       <button class="btn-main" id="btnProcess" onclick="processAudit()">
@@ -441,6 +460,14 @@
     </div>
 
     <div id="resultsSection">
+      <!-- Banner de Averiguação de Escala -->
+      <div id="scaleAuditCard" style="background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.3); border-radius: 16px; padding: 18px 22px; margin-bottom: 20px;">
+        <div style="font-weight: 700; color: #60a5fa; display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+          <span>📐</span> <span>Averiguação de Escala & Proporção das Medidas</span>
+        </div>
+        <div id="scaleAuditText" style="font-size: 0.88rem; color: #e2e8f0; line-height: 1.5;"></div>
+      </div>
+
       <!-- Banner de Inconsistências -->
       <div id="diagnosticsCard" class="diagnostics-card" style="display: none;">
         <div class="diagnostics-title">
@@ -569,6 +596,10 @@
       if (bomInput.files.length) {
         formData.append('bom_file', bomInput.files[0]);
       }
+      const scaleVal = document.getElementById('scaleSelect').value;
+      if (scaleVal !== 'auto') {
+        formData.append('unit_override', scaleVal);
+      }
 
       loader.style.display = 'block';
       resultsSection.style.display = 'none';
@@ -580,6 +611,21 @@
 
         projectTitle.innerText = data.filename;
         disciplineBadge.innerText = 'Disciplinas: ' + (data.summary.disciplinas_detectadas.join(', ') || 'Geral');
+
+        // Exibir Averiguação de Escala
+        const esc = data.summary.auditoria_escala || {};
+        let scaleHtml = `<strong>Unidade Detectada:</strong> ${esc.unidade_detectada || 'N/D'} (Fator de Conversão: divide por ${esc.divisor_aplicado || 1000} para metros).<br>`;
+        scaleHtml += `<span style="color: #94a3b8;">${esc.explicacao_tecnica || ''}</span>`;
+        if (esc.cotas_amostra_para_conferencia && esc.cotas_amostra_para_conferencia.length > 0) {
+          scaleHtml += `<div style="margin-top: 8px; font-size: 0.82rem; color: #60a5fa;">`;
+          scaleHtml += `<strong>Amostra de Cotas no Arquivo para Conferência no CAD (Comando DIST):</strong><br>`;
+          esc.cotas_amostra_para_conferencia.slice(0, 3).forEach(c => {
+            const vMetros = (c.valor_cad / esc.divisor_aplicado).toFixed(2);
+            scaleHtml += `• Layer [${c.layer}]: ${c.valor_cad} unidades CAD = <strong>${vMetros} m</strong><br>`;
+          });
+          scaleHtml += `</div>`;
+        }
+        document.getElementById('scaleAuditText').innerHTML = scaleHtml;
 
         currentPromptSummary = data.prompt_text;
         currentPromptTopology = data.topology_text || '';
@@ -658,6 +704,10 @@
       formData.append('file', cadInput.files[0]);
       if (bomInput.files.length) {
         formData.append('bom_file', bomInput.files[0]);
+      }
+      const scaleVal = document.getElementById('scaleSelect').value;
+      if (scaleVal !== 'auto') {
+        formData.append('unit_override', scaleVal);
       }
 
       try {

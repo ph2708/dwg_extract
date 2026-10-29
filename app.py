@@ -29,10 +29,11 @@ async def index(request: Request):
 @app.post("/api/extract")
 async def api_extract(
     file: UploadFile = File(...),
-    bom_file: Optional[UploadFile] = File(None)
+    bom_file: Optional[UploadFile] = File(None),
+    unit_override: Optional[str] = Form(None)
 ):
     """
-    Processa o projeto CAD e, se fornecida, cruza com a Lista de Materiais do Projetista (BOM).
+    Processa o projeto CAD com averiguação de escala e cruza com a Lista de Materiais (BOM).
     """
     if not file.filename.lower().endswith((".dwg", ".dxf")):
         return JSONResponse(
@@ -46,7 +47,7 @@ async def api_extract(
             shutil.copyfileobj(file.file, f)
 
         try:
-            summary = extract_project_summary(str(tmp_cad))
+            summary = extract_project_summary(str(tmp_cad), user_scale_override=unit_override)
             prompt_text = format_ai_prompt(summary)
             topology_text = format_topology_text(summary)
 
@@ -79,7 +80,8 @@ async def api_extract(
 @app.post("/api/export-excel")
 async def api_export_excel(
     file: UploadFile = File(...),
-    bom_file: Optional[UploadFile] = File(None)
+    bom_file: Optional[UploadFile] = File(None),
+    unit_override: Optional[str] = Form(None)
 ):
     """
     Gera e faz o download direto da planilha Excel (.xlsx) profissional com fórmulas e abas de cotação.
@@ -93,7 +95,7 @@ async def api_export_excel(
             shutil.copyfileobj(file.file, f)
 
         try:
-            summary = extract_project_summary(str(tmp_cad))
+            summary = extract_project_summary(str(tmp_cad), user_scale_override=unit_override)
             audit_results = None
 
             if bom_file and bom_file.filename:
