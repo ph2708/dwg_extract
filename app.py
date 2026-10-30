@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -105,12 +106,22 @@ async def api_export_excel(
                     audit_results = cross_check_cad_and_bom(summary, bom_items)
 
             excel_bytes = generate_budget_excel(summary, audit_results)
-            output_name = Path(file.filename).stem + "_Orcamento_Auditado.xlsx"
+            
+            import unicodedata
+            import urllib.parse
+            
+            raw_stem = Path(file.filename).stem
+            ascii_stem = unicodedata.normalize('NFKD', raw_stem).encode('ASCII', 'ignore').decode('ASCII')
+            ascii_stem = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', ascii_stem).strip('_') or "Projeto"
+            fallback_filename = f"{ascii_stem}_Orcamento_Auditado.xlsx"
+            utf8_filename = urllib.parse.quote(f"{raw_stem}_Orcamento_Auditado.xlsx")
 
             return Response(
                 content=excel_bytes,
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                headers={"Content-Disposition": f'attachment; filename="{output_name}"'}
+                headers={
+                    "Content-Disposition": f"attachment; filename=\"{fallback_filename}\"; filename*=UTF-8''{utf8_filename}"
+                }
             )
         except Exception as e:
             return JSONResponse(status_code=500, content={"error": f"Erro ao gerar Excel: {str(e)}"})
