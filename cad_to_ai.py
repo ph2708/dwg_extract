@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
 Extrator e Auditor Universal Multidisciplinar de Projetos CAD (DWG / DXF)
-Com Limpeza de Ruídos, Desduplicação de Vistas (Planta vs Corte) e Consolidação de Materiais
+Com Limpeza de Ruídos, Detecção Multi-Pavimentos (Térreo, Superior, Ático),
+Desduplicação de Vistas (Planta vs Corte) e Extração de Elétrica e Hidráulica
 """
 
 import os
 import sys
 import json
 import re
+import math
 import subprocess
 from pathlib import Path
 from collections import Counter
 import ezdxf
 
-# Camadas que NUNCA são tubulações físicas ou materiais de compra
+# Camadas que NUNCA são tubulações físicas, eletrodutos ou materiais de compra
 IGNORED_LAYERS = {
     "QUADRO", "LIMITE DE DESENHO", "MARGEM", "SELO", "FORMATO", 
     "INDICAÇÃO DE CORTE", "INDICACAO DE CORTE", "INDICAÇÃO DE SUPORTE",
@@ -22,20 +24,30 @@ IGNORED_LAYERS = {
     "IND_EIXOS", "NIVEL", "NIVEIS", "CIVIL", "CONCRETO", "BASE_CONCRETO", "PROJEÇÃO", "PROJECAO",
     "ESCADA", "GRADE", "VALA_TUBULACAO", "VALA", "MEC-PIPE-RACK", "06_HACHURA", "ALVENARIA",
     "AQ-ALVENARIA", "TYCO-ALVENARIA", "AQ-ESQUADRIAS", "CAIXILHOS", "BASE", "0",
-    "CALCULO HIDRAULICO", "DETALHE", "INDIC CORTE", "33-FIRE_PUMP_FUEL"
+    "CALCULO HIDRAULICO", "DETALHE", "INDIC CORTE", "33-FIRE_PUMP_FUEL",
+    "E_FIACAO", "FIACAO", "FIAÇÃO", "TEXTO-02", "TEXT-2", "TEXT-1", "TEXT-02", "TEXT-4", "TEXTO-01",
+    "AUXILIAR-01", "EL_AUXILIAR-01", "EL-AUXILIAR-01", "AUXILIAR-1", "AUXILIAR-2",
+    "AR_MOBILIA", "AR_ESQUADRIA", "AR_ALVENARIA", "31A-PAREDE_01", "34A-PROJEÇÕES", "PROJEÇÕES"
 }
 
-# Camadas que representam conexões, válvulas ou equipamentos (NUNCA somar como metragem linear de tubo)
+# Camadas que representam conexões, válvulas, simbologias ou equipamentos (NUNCA somar como metragem linear de tubo)
 NON_PIPE_COMPONENT_LAYERS = {
     "CONEXÃO", "CONEXAO", "CONEXÃO MECÃNICA", "CONEXAO MECANICA", "WS-MV CONEX",
     "VALVULA", "VÁLVULA", "VALVULA RO", "DIVISAO_DE_VALVULAS",
     "FLANGE", "FLANGES", "JUNTA", "ACOPLAMENTO",
-    "TANQUE", "TANQUE DIESEL", "SUPORTE", "INDICAÇÃO DE SUPORTE", "INSTRUMENT"
+    "TANQUE", "TANQUE DIESEL", "SUPORTE", "INDICAÇÃO DE SUPORTE", "INSTRUMENT",
+    "E_SIMBOLOGIA", "EL_SIMBOL", "SIMB-ELET", "EL_SIMBOLOGIA", "SIMBOLOGIA-TV"
 }
 
-# Palavras que confirmam que a camada é uma rede de tubulação real
-TRUE_PIPE_KEYWORDS = [
-    "TUBULAÇÃO", "TUBULACAO", "TUBO", "TUBUL", "PIPE", "CANO", "REDE"
+# Palavras que confirmam que a camada é uma rede linear física real (tubo ou eletroduto)
+LINEAR_MATERIAL_KEYWORDS = [
+    # Hidráulica / Incêndio / Mecânica
+    "TUBULAÇÃO", "TUBULACAO", "TUBO", "TUBUL", "PIPE", "CANO", "REDE",
+    "INCÊNDIO", "INCENDIO", "ESGOTO", "AGUA", "ÁGUA", "PLUVIAL", "DRENO", "DRENAGEM",
+    "SPRINKLER", "SPK", "HIDRANTE", "DIESEL", "COBRE", "GAS", "GÁS",
+    # Elétrica / Infraestrutura
+    "ELETRODUTO", "CONDUITE", "CONDUTO", "E_ELET", "ELET_", "EL_CABO", "CABO PP",
+    "ELETROCALHA", "PERFILADO", "LEITO"
 ]
 
 DISCIPLINES_KEYWORDS = {
@@ -46,10 +58,11 @@ DISCIPLINES_KEYWORDS = {
         "ACOPLAMENTO", "CURVA", "REDUÇÃO", "REDUCAO", "TE "
     ],
     "ELETRICA_AUTOMACAO_DETECCAO": [
-        "ELETRODUTO", "CONDUITE", "CONDULETE", "CABO", "FIACAO", "FIAÇÃO", "CIRCUITO",
-        "QUADRO", "QGBT", "DETECÇÃO", "DETECCAO", "DETECTOR", "ACIONADOR", "SIRENE",
-        "ILUMINACAO", "ILUMINAÇÃO", "TOMADA", "LAÇO", "LEITO", "ELETROCALHA", "PERFILADO",
-        "PAINEL", "INVERSOR", "TRANSFORMADOR", "TERRA", "SPDA"
+        "ELETRODUTO", "CONDUITE", "CONDULETE", "CONDUTO", "E_ELET", "EL_CABO", "CABO",
+        "FIACAO", "FIAÇÃO", "CIRCUITO", "QUADRO", "QGBT", "QDG", "QD", "DETECÇÃO", "DETECCAO",
+        "DETECTOR", "ACIONADOR", "SIRENE", "ILUMINACAO", "ILUMINAÇÃO", "LUMINARIA", "LUMINÁRIA",
+        "TOMADA", "LAÇO", "LEITO", "ELETROCALHA", "PERFILADO", "PAINEL", "INVERSOR", "TRANSFORMADOR",
+        "TERRA", "SPDA", "BARRAMENTO", "E_SIMBOLOGIA", "EL_SIMBOL", "SIMB-ELET", "CAMPAINHA", "INTERRUPTOR"
     ],
     "CLIMATIZACAO_HVAC": [
         "DUTO", "DIFUSOR", "GRELHA", "FANCOIL", "CHILLER", "SPLIT", "EXAUSTAO", "EXAUSTÃO"
@@ -113,18 +126,57 @@ def is_anonymous_block(name: str) -> bool:
 def extract_diameter_from_string(text: str) -> str:
     if not text:
         return ""
-    m = DIAM_REGEX.search(text)
+    upper = text.upper()
+    # Ignora explicitamente dimensões de caixas elétricas e alturas de montagem
+    if any(k in upper for k in ["CAIXA", "CX ", "QUADRADA", "RETANGULAR", "OCTOGONAL", "H =", "H="]):
+        return ""
+
+    t = text.replace("%%C", "Ø").replace("%%c", "Ø").replace("∅", "Ø")
+    # Limpa multiplicadores como 2x, 1x
+    t = re.sub(r"\b\d+\s*[xX]\s*", "", t)
+    # Remove caixas de passagem como 4x4, 4x2, 20x20
+    t = re.sub(r"\d+\s*[xX]\s*\d+[\"\w]*", "", t)
+
+    # 1. Busca por Ø seguido por diâmetro ou fração (ex: Ø3/4", Ø1.1/4", Ø14")
+    m = re.search(r"Ø\s*([0-9]+(?:\.[0-9]+)?(?:\s*[-/]\s*[0-9]+(?:\.[0-9]+)?)?)\s*\"?", t)
     if m:
-        val = m.group(0).strip()
-        val = val.replace("∅", "Ø")
-        if not val.startswith("Ø") and not val.upper().startswith("DN"):
-            val = "Ø" + val
-        return val
+        num = m.group(1).replace(" ", "")
+        return f"Ø{num}\"" if not num.endswith("\"") else f"Ø{num}"
+
+    # 2. Busca frações explícitas com aspas como 3/4", 1.1/4", 2.1/2", 1"
+    m2 = re.search(r"\b([0-9]+(?:\.[0-9]+)?(?:\s*/\s*[0-9]+)?)\s*\"", t)
+    if m2:
+        num = m2.group(1).replace(" ", "")
+        return f"Ø{num}\""
+
+    # 3. Formato DN como DN50, DN 100
+    m3 = re.search(r"\bDN\s*([0-9]{2,3})\b", t, re.IGNORECASE)
+    if m3:
+        return f"DN{m3.group(1)}"
+
     return ""
 
 def canonical_pipe_network(layer: str) -> str:
-    """Padroniza o nome comercial da tubulação para o relatório e planilha."""
+    """Padroniza o nome comercial da tubulação ou eletroduto para o relatório e planilha."""
     lu = layer.upper()
+    
+    # 1. Elétrica e Infraestrutura
+    if "E_ELET_EMB" in lu or "ELET_EMB" in lu:
+        return "Eletroduto Flexível Corrugado / Rígido Embutido (Laje/Parede)"
+    if "E_ELET_PISO" in lu or "ELET_PISO" in lu:
+        return "Eletroduto de Piso PEAD / PVC Rígido"
+    if "ELETRODUTO" in lu or "CONDUITE" in lu:
+        if "APARENTE" in lu:
+            return "Eletroduto Aparente (Aço Galvanizado)"
+        return "Eletroduto PVC Corrugado / Rígido"
+    if "BARRAMENTO" in lu:
+        return "Barramentos de Cobre de Distribuição"
+    if "CABO PP" in lu or "CABO_PP" in lu:
+        return "Cabo Multipolar Flexível PP"
+    if "ELETROCALHA" in lu or "PERFILADO" in lu or "LEITO" in lu:
+        return f"Infraestrutura Elétrica ({layer})"
+
+    # 2. Hidráulica, Incêndio e Mecânica
     if "COBRE" in lu:
         return "Tubulação de Cobre"
     if "DIESEL" in lu or "OLEO" in lu or "COMBUSTIVEL" in lu:
@@ -133,23 +185,77 @@ def canonical_pipe_network(layer: str) -> str:
         return "Tubulação de Sprinklers"
     if any(k in lu for k in ["INCÊNDIO", "INCENDIO", "TUBO-INC", "TUBUL INC"]):
         return "Tubulação de Incêndio (Aço Carbono)"
+    if any(k in lu for k in ["ESGOTO", "SANITARIO", "SANITÁRIO"]):
+        return "Tubulação de Esgoto Sanitário (PVC)"
+    if any(k in lu for k in ["AGUA", "ÁGUA", "AF", "AQ"]):
+        return "Tubulação de Água (PVC / PPR / Cobre)"
+    if any(k in lu for k in ["PLUVIAL", "DRENO", "DRENAGEM"]):
+        return "Tubulação de Águas Pluviais / Drenagem"
+        
     return f"Tubulação ({layer})"
 
 def canonical_fitting_name(layer: str, name: str, diam: str) -> tuple[str, str, str]:
     """
-    Consolida nomes de conexões, suportes, válvulas e equipamentos,
-    eliminando variações de vistas (frontal, lateral, traseira) e hashes anônimos.
+    Consolida nomes de componentes elétricos, conexões, suportes, válvulas e equipamentos.
     Retorna: (categoria_principal, descricao_comercial, diametro_nominal)
     """
     combined = (layer + " " + name).upper()
     d_val = diam or ""
 
-    # 1. Suportes de Tubulação
+    # ==========================================
+    # 1. COMPONENTES ELÉTRICOS (NBR 5410)
+    # ==========================================
+    # Tomadas
+    if any(k in combined for k in ["TOMADA", "TUE"]) or name in ("T1", "T2", "T3", "T4"):
+        if name == "T1" or "BAIXA" in combined or "H=30" in combined or "H = 30" in combined:
+            return "Elétrica - Tomada", "Tomada Baixa 2P+T 10A/20A (H=30cm)", d_val or "10A / 250V"
+        elif name == "T3" or "ALTA" in combined or "H=210" in combined or "H = 210" in combined:
+            return "Elétrica - Tomada", "Tomada Alta / Média 2P+T 20A (H=110cm/210cm)", d_val or "20A / 250V"
+        elif name == "T2" or "MEDIA" in combined or "MÉDIA" in combined or "H=110" in combined or "H = 110" in combined:
+            return "Elétrica - Tomada", "Tomada Média 2P+T 10A (H=110cm)", d_val or "10A / 250V"
+        elif "PISO" in combined:
+            return "Elétrica - Tomada", "Tomada de Piso 2P+T em Caixa 4x4\"", d_val or "20A / 250V"
+        return "Elétrica - Tomada", f"Tomada Universal 2P+T ({name})", d_val or "10A/20A"
+
+    # Interruptores
+    if any(k in combined for k in ["INTERRUPTOR", "PARALELO", "INTERMEDIARIO"]) or name in ("a1", "a2", "b1", "b2", "c1", "s1", "LIG-1-1"):
+        if "PARALELO" in combined or "THREE" in combined:
+            return "Elétrica - Interruptor", "Interruptor Paralelo (Three-Way) H=110cm", "-"
+        elif "INTERMEDIARIO" in combined or "FOUR" in combined:
+            return "Elétrica - Interruptor", "Interruptor Intermediário (Four-Way) H=110cm", "-"
+        elif name == "LIG-1-1":
+            return "Elétrica - Interruptor", "Ponto de Comando / Ligação de Iluminação", "-"
+        return "Elétrica - Interruptor", "Interruptor Simples de Parede 1 a 3 Teclas (H=110cm)", "-"
+
+    # Iluminação / Luminárias
+    if any(k in combined for k in ["LUM", "LUMI", "LUMINARIA", "LUMINÁRIA", "ILUM", "LAMP", "ESPETO", "SPOT", "PLAFONIER", "ARANDELA"]):
+        if "ESPETO" in combined or "JARDIM" in combined:
+            return "Elétrica - Iluminação", "Luminária Spot / Espeto de Jardim para Iluminação Externa", "-"
+        elif "ARANDELA" in combined or "PAREDE" in combined:
+            return "Elétrica - Iluminação", "Arandela de Parede / Ponto de Iluminação (H=210cm)", "-"
+        elif "SPOT" in combined or "EMBUTIR" in combined:
+            return "Elétrica - Iluminação", "Luminária Spot LED de Embutir", "-"
+        return "Elétrica - Iluminação", f"Ponto de Iluminação em Teto / Laje ({name})", "-"
+
+    # Quadros de Distribuição
+    if any(k in combined for k in ["QUADRO", "QGBT", "QDG", "QD1", "QD2", "QDC", "PAINEL ELETRICO", "PAINEL ELÉTRICO"]):
+        return "Elétrica - Painel", "Quadro de Distribuição de Circuitos de Embutir (QDC / QDG)", d_val or "-"
+
+    # Acessórios Elétricos
+    if any(k in combined for k in ["CAMPAINHA", "CIGARRA"]):
+        return "Elétrica - Acessório", "Ponto de Campainha / Sinalizador Sonoro", "-"
+    if any(k in combined for k in ["SENSOR", "FOTOCELULA", "FOTOCÉLULA"]):
+        return "Elétrica - Acessório", "Sensor de Presença / Fotocélula para Iluminação", "-"
+
+    # ==========================================
+    # 2. COMPONENTES HIDRÁULICOS E INDUSTRIAIS
+    # ==========================================
+    # Suportes de Tubulação
     if "SUPORTE" in combined or name.lower().startswith("sup"):
         d = d_val or ("Ø14\"" if "14" in combined else ("Ø4\"" if "4" in combined else ("Ø2\"" if "2" in combined else "-")))
         return "Suporte / Fixação", "Suporte Metálico de Tubulação (Tipo Hanger / Abraçadeira)", d
 
-    # 2. Curvas
+    # Curvas
     if any(k in combined for k in ["CURVAS 90", "CURVA 90", "CURVA 14X90", "COTOVELO 90"]):
         d = d_val or ("Ø14\"" if "14" in combined else ("Ø10\"" if "10" in combined else ("Ø4\"" if "4" in combined else ("Ø2\"" if "2" in combined else ""))))
         d_label = f" {d}" if d else ""
@@ -159,33 +265,33 @@ def canonical_fitting_name(layer: str, name: str, diam: str) -> tuple[str, str, 
         d_label = f" {d_val}" if d_val else ""
         return "Conexão - Curva", f"Curva 45°{d_label}", d_val or "-"
 
-    # 3. Tês
+    # Tês
     if any(k in combined for k in ["TE -", "TE ", "TEE", "TÊ"]):
         d = d_val or ("Ø10\"" if "10" in combined else ("Ø2.1/2\"" if "2-1-2" in combined else ("Ø2\"" if "2" in combined else "")))
         d_label = f" {d}" if d else ""
         return "Conexão - Tê", f"Conexão Tê Reto Industrial{d_label}", d or "-"
 
-    # 4. Flanges
+    # Flanges
     if any(k in combined for k in ["FLANGE", "CONTRAFLANGE", "ADAPTADOR"]):
         d_label = f" {d_val}" if d_val else ""
         return "Flange / Adaptador", f"Flange com Ressalto ANSI B16.5{d_label}", d_val or "-"
 
-    # 5. Juntas de Expansão
+    # Juntas de Expansão
     if "JUNTA" in combined:
         d_label = f" {d_val}" if d_val else ""
         return "Junta / Flexível", f"Junta de Expansão Flexível com Tensores{d_label}", d_val or "-"
 
-    # 6. Acoplamentos Ranhurados
+    # Acoplamentos Ranhurados
     if any(k in combined for k in ["ACOPLAMENTO", "COUPLING", "GROOVED"]):
         d_label = f" {d_val}" if d_val else ""
         return "Acoplamento Ranhurado", f"Acoplamento Ranhurado (Grooved){d_label}", d_val or "-"
 
-    # 7. Reduções
+    # Reduções
     if any(k in combined for k in ["REDUÇÃO", "REDUCAO", "REDUCER"]):
         d_label = f" {d_val}" if d_val else ""
         return "Conexão - Redução", f"Redução Concêntrica/Excêntrica{d_label}", d_val or "-"
 
-    # 8. Válvulas
+    # Válvulas
     if any(k in combined for k in ["VALVULA", "VÁLVULA", "RETENÇÃO", "RETENCAO", "GAVETA", "BORBOLETA", "ESFERA", "ALÍVIO", "ALIVIO"]):
         if "RETENÇÃO" in combined or "RETENCAO" in combined:
             d = d_val or ("Ø14\"" if "14" in combined else "")
@@ -207,7 +313,7 @@ def canonical_fitting_name(layer: str, name: str, diam: str) -> tuple[str, str, 
         d_label = f" {d_val}" if d_val else ""
         return "Válvula / Registro", f"Válvula Industrial{d_label}", d_val or "-"
 
-    # 9. Bombas e Equipamentos
+    # Bombas e Motores
     if any(k in combined for k in ["BOMBA", "PUMP", "MOTOR"]):
         if "JOCKEY" in combined:
             return "Equipamento / Bomba", "Conjunto Moto-Bomba Jockey", "-"
@@ -220,12 +326,11 @@ def canonical_fitting_name(layer: str, name: str, diam: str) -> tuple[str, str, 
     if "HIDRANTE" in combined:
         return "Hidrante", "Válvula / Ponto de Hidrante", d_val or "-"
 
-    # 10. Conexões anônimas na layer CONEXÃO
+    # Conexões em layers específicas
     if any(k in combined for k in ["CONEXÃO", "CONEXAO"]):
         d_label = f" {d_val}" if d_val else ""
         return "Conexão / Acoplamento", f"Conexão Hidráulica Ranhurada / Soldada{d_label}", d_val or "-"
 
-    # Blocos anônimos sem classificação prévia
     if is_anonymous_block(name):
         d_label = f" {d_val}" if d_val else ""
         return "Conexão / Acessório", f"Conexão Industrial ({layer}){d_label}", d_val or "-"
@@ -234,6 +339,10 @@ def canonical_fitting_name(layer: str, name: str, diam: str) -> tuple[str, str, 
     return "Acessório / Conexão", f"{name}{d_label}", d_val or "-"
 
 def detect_cad_scale_factor(msp) -> tuple[float, str, str, list[dict]]:
+    """
+    Averigua a escala e unidade do desenho CAD contra as cotas DIMENSION e a geometria real,
+    filtrando ruídos de anotações e fiação para não distorcer a escala de projetos residenciais.
+    """
     dimension_samples = []
     for d in msp.query("DIMENSION"):
         val = getattr(d.dxf, "actual_measurement", None)
@@ -245,13 +354,20 @@ def detect_cad_scale_factor(msp) -> tuple[float, str, str, list[dict]]:
                 "layer": d.dxf.layer
             })
 
-    line_lengths = []
-    for l in msp.query("LINE"):
-        mag = (l.dxf.start - l.dxf.end).magnitude
-        if mag > 10:
-            line_lengths.append(mag)
+    if dimension_samples:
+        vals = [s["valor_cad"] for s in dimension_samples]
+    else:
+        # Quando não há DIMENSION, analisa comprimentos excluindo marcações de fios e hachuras
+        line_lengths = []
+        for l in msp.query("LINE"):
+            layer_u = l.dxf.layer.upper()
+            if any(k in layer_u for k in ["FIACAO", "FIAÇÃO", "HATCH", "HACHURA", "DEFPOINTS"]):
+                continue
+            mag = (l.dxf.start - l.dxf.end).magnitude
+            if mag > 15:
+                line_lengths.append(mag)
+        vals = line_lengths
 
-    vals = [s["valor_cad"] for s in dimension_samples] if dimension_samples else line_lengths
     if not vals:
         return 1000.0, "Milímetros (mm)", "Padrão de engenharia mecânica assumido (1 unidade = 1 mm).", []
 
@@ -265,63 +381,107 @@ def detect_cad_scale_factor(msp) -> tuple[float, str, str, list[dict]]:
     elif median_val >= 20:
         divisor = 100.0
         unit = "Centímetros (cm)"
-        expl = f"Mediana geométrica = {median_val:.1f} unidades. O desenho está em centímetros. Fator de conversão: divide por 100 para metros."
+        expl = f"Mediana geométrica = {median_val:.1f} unidades. O desenho foi construído em centímetros (1 unidade CAD = 1 cm). Fator de conversão: divide por 100 para metros."
     else:
         divisor = 1.0
         unit = "Metros (m)"
-        expl = f"Mediana geométrica = {median_val:.2f} unidades. O desenho está em metros (1 unidade CAD = 1 metro)."
+        expl = f"Mediana geométrica = {median_val:.2f} unidades. O desenho foi construído em metros (1 unidade CAD = 1 metro)."
 
     return divisor, unit, expl, dimension_samples[:10]
 
 def detect_drawing_views(msp) -> tuple[bool, dict]:
     """
-    Detecta se o arquivo CAD possui múltiplas vistas desenhadas lado a lado (ex: PLANTA e CORTE).
-    Quando presente, define o divisor espacial para auditar a PLANTA BAIXA e desduplicar os CORTES.
+    Detecta de forma inteligente todas as vistas do desenho:
+    - Multi-Pavimentos Reais (Térreo, Pavimento Superior, Ático, Cobertura, Cimentação)
+    - Vistas de Projeção / Cortes para desduplicação (Corte A-A, Fachadas, Elevações)
+    - Regiões de Legenda / Simbologia para não contar ícones de exemplo
     """
-    views = []
+    raw_views = []
     for ent in msp:
         if ent.dxftype() in ("TEXT", "MTEXT"):
             raw = ent.dxf.text if ent.dxftype() == "TEXT" else ent.text
             loc = getattr(ent.dxf, "insert", None)
-            txt = raw.strip().upper()
-            if loc and any(txt == k or txt.startswith(k + " ") or txt.startswith(k + "-") for k in [
-                "PLANTA", "PLANTA BAIXA", "LAYOUT", "CORTE", "ELEVAÇÃO", "ELEVACAO", "DETALHE", "SEÇÃO"
-            ]):
-                views.append((loc.x, loc.y, txt))
+            if not loc:
+                continue
+            txt = raw.strip()
+            u = txt.upper()
+            if len(txt) > 65 or not txt:
+                continue
 
-    has_planta = any("PLANTA" in v[2] or "LAYOUT" in v[2] for v in views)
-    has_corte = any("CORTE" in v[2] or "ELEVA" in v[2] or "DETALHE" in v[2] for v in views)
+            # Ignora marcadores de circuitos, notas de fiação ou itens de legenda com hífen
+            if txt.startswith("-") or txt.startswith("•") or txt.startswith("*"):
+                continue
+            if any(w in u for w in ["CHUVEIRO", "TOMADA", "ILUM", "DISJUNTOR", "CIRCUITO", "ELETRODUTO", "INTERRUPTOR", "CABO", "ESCALA", "PROJEÇÃO", "PROJECAO"]):
+                continue
 
-    if has_planta and has_corte:
-        planta_v = [v for v in views if "PLANTA" in v[2] or "LAYOUT" in v[2]][0]
-        corte_v = [v for v in views if "CORTE" in v[2] or "ELEVA" in v[2] or "DETALHE" in v[2]][0]
-        
-        p_x, p_y = planta_v[0], planta_v[1]
-        c_x, c_y = corte_v[0], corte_v[1]
+            # 1. Projeções / Cortes / Fachadas (Não aditivas - devem ser desduplicadas)
+            if any(k in u for k in ["CORTE", "SECTION", "SEÇÃO", "SECAO", "FACHADA", "ELEVATION", "ELEVAÇÃO", "ELEVACAO", "VISTA LATERAL", "VISTA FRONTAL"]):
+                raw_views.append({"type": "PROJECTION", "name": txt, "pos": (loc.x, loc.y)})
+            
+            # 2. Legendas e Diagramas Unifilares (Não contar blocos de demonstração)
+            elif any(k in u for k in ["SIMBOLOGIA", "LEGENDA", "QUADRO DE CARGAS", "DIAGRAMA UNIFILAR"]):
+                raw_views.append({"type": "LEGEND", "name": txt, "pos": (loc.x, loc.y)})
 
-        if abs(c_x - p_x) >= abs(c_y - p_y):
-            split_x = (p_x + c_x) / 2
-            is_master_fn = (lambda x, y: x < split_x) if p_x < c_x else (lambda x, y: x >= split_x)
-            split_desc = f"Eixo X ({split_x:.0f})"
-        else:
-            split_y = (p_y + c_y) / 2
-            is_master_fn = (lambda x, y: y < split_y) if p_y < c_y else (lambda x, y: y >= split_y)
-            split_desc = f"Eixo Y ({split_y:.0f})"
+            # 3. Pavimentos / Plantas Reais (Aditivas - somam no quantitativo e segregam por andar)
+            elif "PLANTA" in u or any(k in u for k in ["TÉRREO", "TERREO", "BAJA", "SUPERIOR", "ALTA", "PISO", "ÁTICO", "ATICO", "AZOTEA", "COBERTURA", "PAVIMENTO", "PAVTO", "FIRST FLOOR", "SECOND FLOOR"]):
+                floor_name = txt
+                if any(k in u for k in ["TÉRREO", "TERREO", "BAJA", "PRIMER PISO", "1º", "1°", "GROUND"]):
+                    floor_name = "Pavimento Térreo"
+                elif any(k in u for k in ["SUPERIOR", "ALTA", "SEGUNDO PISO", "2º", "2°", "SECOND"]):
+                    floor_name = "Pavimento Superior"
+                elif any(k in u for k in ["ÁTICO", "ATICO", "AZOTEA", "COBERTURA", "ROOF", "TECHOS"]):
+                    floor_name = "Ático / Cobertura"
+                elif any(k in u for k in ["CIMENTA", "FUNDA"]):
+                    floor_name = "Fundações / Cimentação"
+                elif "PLANTA" in u:
+                    floor_name = txt
 
-        return True, {
-            "possui_planta_e_corte": True,
-            "vistas": ["Planta Baixa (Área Master)", "Cortes / Detalhamentos (Vistas Laterais)"],
-            "split_desc": split_desc,
-            "is_master_fn": is_master_fn,
-            "mensagem": "Projeto com PLANTA BAIXA e CORTES identificado. A auditoria utilizou a Planta Baixa como base de quantitativos para evitar duplicações dos componentes desenhados nas vistas de corte."
-        }
+                raw_views.append({"type": "FLOOR", "name": floor_name, "pos": (loc.x, loc.y)})
 
-    # Desenho único sem cortes separados
-    return False, {
-        "possui_planta_e_corte": False,
-        "vistas": ["Área Integral"],
-        "is_master_fn": (lambda x, y: True),
-        "mensagem": "Desenho auditado em área integral."
+    # Agrupa múltiplos títulos que apontam para o mesmo pavimento calculando o baricentro
+    floor_clusters = {}
+    for v in raw_views:
+        if v["type"] == "FLOOR":
+            floor_clusters.setdefault(v["name"], []).append(v["pos"])
+
+    consolidated_views = []
+    for fname, pts in floor_clusters.items():
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        consolidated_views.append({"type": "FLOOR", "name": fname, "pos": (cx, cy)})
+
+    for v in raw_views:
+        if v["type"] in ("PROJECTION", "LEGEND"):
+            consolidated_views.append(v)
+
+    floors = [v["name"] for v in consolidated_views if v["type"] == "FLOOR"]
+    projections = [v["name"] for v in consolidated_views if v["type"] == "PROJECTION"]
+
+    def classify_point(x: float, y: float) -> tuple[str, str]:
+        if not consolidated_views:
+            return "FLOOR", "Área Integral"
+        best_v = min(consolidated_views, key=lambda v: math.hypot(x - v["pos"][0], y - v["pos"][1]))
+        return best_v["type"], best_v["name"]
+
+    has_multi = len(floors) > 1 or len(projections) > 0
+
+    if len(floors) > 1 and len(projections) > 0:
+        msg = f"Projeto Multi-Pavimentos ({', '.join(floors)}) com Cortes/Fachadas ({', '.join(projections[:3])}). A auditoria quantificou todos os andares reais e desduplicou as vistas de projeção."
+    elif len(floors) > 1:
+        msg = f"Projeto Multi-Pavimentos identificado ({', '.join(floors)}). Materiais quantificados e segregados por andar sem omissões."
+    elif len(projections) > 0:
+        msg = f"Projeto com Planta Baixa e Cortes ({', '.join(projections[:3])}). A auditoria utilizou a Planta Baixa como base de quantitativos para evitar duplicações dos cortes."
+    else:
+        msg = "Desenho auditado em área integral."
+
+    return has_multi, {
+        "possui_planta_e_corte": len(projections) > 0 or len(floors) > 1,
+        "possui_multi_pavimentos": len(floors) > 1,
+        "vistas_detectadas": floors if floors else ["Área Integral"],
+        "vistas_projeções_ignoradas": projections,
+        "classify_point": classify_point,
+        "is_master_fn": (lambda x, y: classify_point(x, y)[0] == "FLOOR"),
+        "mensagem": msg
     }
 
 def extract_project_summary(file_path: str, user_scale_override: str = None) -> dict:
@@ -358,6 +518,7 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
                 unit_name = "Metros (m) [Manual]"
 
         has_multi_views, view_info = detect_drawing_views(msp)
+        classify_pt = view_info["classify_point"]
         is_master_fn = view_info["is_master_fn"]
 
         summary = {
@@ -372,14 +533,17 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
                 "cotas_amostra_para_conferencia": sample_dims
             },
             "auditoria_vistas": {
-                "possui_planta_e_corte": has_multi_views,
-                "vistas_detectadas": view_info["vistas"],
+                "possui_planta_e_corte": view_info["possui_planta_e_corte"],
+                "possui_multi_pavimentos": view_info["possui_multi_pavimentos"],
+                "vistas_detectadas": view_info["vistas_detectadas"],
+                "vistas_projeções_ignoradas": view_info["vistas_projeções_ignoradas"],
                 "mensagem": view_info["mensagem"]
             },
             "tubulacoes_por_diametro": {},
             "conexoes_e_acoplamentos": {},
             "elementos_pontuais": {},
             "metragens_lineares_metros": {},
+            "detalhamento_por_pavimento": {},
             "tags_identificadores": [],
             "especificacoes_tecnicas": [],
             "notas_de_prancha": [],
@@ -387,7 +551,14 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
             "cotas_principais_metros": []
         }
 
-        # 1. MAPEAMENTO DE TEXTOS E DIÂMETROS
+        # Inicializa recipientes por pavimento
+        for vname in view_info["vistas_detectadas"]:
+            summary["detalhamento_por_pavimento"][vname] = {
+                "tubulacoes_por_diametro": {},
+                "elementos_pontuais": {}
+            }
+
+        # 1. MAPEAMENTO DE TEXTOS, DIÂMETROS E ESPECIFICAÇÕES
         cad_texts = []
         diam_points = []
         specs = set()
@@ -414,7 +585,7 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
                 if any(w in upper for w in [
                     "VALVULA", "VÁLVULA", "JUNTA", "FLANGE", "RETENÇÃO", "BOMBA", "Ø",
                     "ANSI", "CLASSE", "PSI", "ASTM", "NBR", "SCH", "GPM",
-                    "CABO", "ELETRODUTO", "CIRCUITO", "DETECTOR", "TENSÃO", "KVA", "AMPERE"
+                    "CABO", "ELETRODUTO", "CIRCUITO", "DETECTOR", "TENSÃO", "KVA", "AMPERE", "TOMADA", "DISJUNTOR"
                 ]):
                     specs.add(txt)
 
@@ -434,66 +605,68 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
             best_dist = max_dist
             best_diam = ""
             for dx, dy, dval in diam_points:
-                dist = ((dx-x)**2 + (dy-y)**2)**0.5
+                dist = math.hypot(dx - x, dy - y)
                 if dist < best_dist:
                     best_dist = dist
                     best_diam = dval
             return best_diam
 
-        # 2. FILTRAGEM RIGOROSA DE TUBULAÇÃO REAL (IGNORA QUADRO, LIMITES, CONEXÕES E CORTES)
+        # 2. QUANTIFICAÇÃO RIGOROSA DE TUBULAÇÃO E ELETRODUTOS
         layer_lengths = {}
         diam_pipe_lengths = {}
         linear_segments = []
-        unique_segments = set() # Desduplicação de sobreposições
+        unique_segments = set()
 
-        min_pipe_thresh = 300.0 * (divisor / 1000.0)
-        min_seg_thresh = 600.0 * (divisor / 1000.0)
+        min_pipe_thresh = 150.0 * (divisor / 1000.0)
+        min_seg_thresh = 400.0 * (divisor / 1000.0)
 
-        for line in msp.query("LINE"):
-            layer = line.dxf.layer
+        # Helper para somar trechos lineares e atribuir ao pavimento
+        def process_linear_element(layer: str, length: float, mx: float, my: float, p1: tuple, p2: tuple):
+            nonlocal summary, layer_lengths, diam_pipe_lengths, linear_segments, unique_segments
+            
             layer_u = layer.upper()
-
-            # Filtra camadas ignoradas
             if layer_u in IGNORED_LAYERS or any(k in layer_u for k in NON_PIPE_COMPONENT_LAYERS):
-                continue
-
-            # Confirma que é camada de tubulação
-            if not any(k in layer_u for k in TRUE_PIPE_KEYWORDS):
-                continue
+                return
+            if not any(k in layer_u for k in LINEAR_MATERIAL_KEYWORDS):
+                return
 
             disc = identify_element_discipline(layer)
             if disc == "GERAL":
-                continue
+                return
 
-            mx = (line.dxf.start.x + line.dxf.end.x) / 2
-            my = (line.dxf.start.y + line.dxf.end.y) / 2
+            vtype, vname = classify_pt(mx, my)
+            if vtype != "FLOOR":
+                return  # Ignora cortes, fachadas ou áreas de legenda
 
-            # Se for projeto com cortes, processa apenas a vista master (Planta Baixa)
-            if not is_master_fn(mx, my):
-                continue
-
-            # Desduplicação de linhas sobrepostas
-            p1 = (round(line.dxf.start.x, 1), round(line.dxf.start.y, 1))
-            p2 = (round(line.dxf.end.x, 1), round(line.dxf.end.y, 1))
             seg_key = tuple(sorted([p1, p2]))
             if seg_key in unique_segments:
-                continue
+                return
             unique_segments.add(seg_key)
 
-            length = (line.dxf.start - line.dxf.end).magnitude
             if length > min_pipe_thresh:
                 summary["disciplinas_detectadas"].add(disc)
                 layer_lengths[layer] = layer_lengths.get(layer, 0.0) + length
-                
-                d_found = find_nearest_diameter(mx, my) or "Ø A definir"
-                canon_net = canonical_pipe_network(layer)
 
+                d_found = find_nearest_diameter(mx, my)
+                if not d_found:
+                    if "ELET" in layer_u or "CONDUIT" in layer_u:
+                        d_found = "Ø3/4\" (DN 25mm)"
+                    else:
+                        d_found = "Ø A definir"
+
+                canon_net = canonical_pipe_network(layer)
                 pipe_key = f"{canon_net} - {d_found}"
                 diam_pipe_lengths[pipe_key] = diam_pipe_lengths.get(pipe_key, 0.0) + length
+
+                # Atribuição ao Pavimento
+                if vname in summary["detalhamento_por_pavimento"]:
+                    pav_dict = summary["detalhamento_por_pavimento"][vname]["tubulacoes_por_diametro"]
+                    pav_dict[pipe_key] = pav_dict.get(pipe_key, 0.0) + length
 
                 if length > min_seg_thresh:
                     linear_segments.append({
                         "layer": layer,
+                        "pavimento": vname,
                         "rede": canon_net,
                         "diametro": d_found,
                         "comprimento_m": round(length / divisor, 2),
@@ -502,42 +675,66 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
                         "fim": p2
                     })
 
+        # Processa LINE
+        for line in msp.query("LINE"):
+            p1 = (round(line.dxf.start.x, 1), round(line.dxf.start.y, 1))
+            p2 = (round(line.dxf.end.x, 1), round(line.dxf.end.y, 1))
+            mx = (line.dxf.start.x + line.dxf.end.x) / 2
+            my = (line.dxf.start.y + line.dxf.end.y) / 2
+            length = (line.dxf.start - line.dxf.end).magnitude
+            process_linear_element(line.dxf.layer, length, mx, my, p1, p2)
+
+        # Processa ARC (Curvas de eletrodutos elétricos)
+        for arc in msp.query("ARC"):
+            r = arc.dxf.radius
+            sa = arc.dxf.start_angle
+            ea = arc.dxf.end_angle
+            if ea < sa:
+                ea += 360.0
+            length = r * math.radians(ea - sa)
+            mx = arc.dxf.center.x
+            my = arc.dxf.center.y
+            p1 = (round(mx - r, 1), round(my, 1))
+            p2 = (round(mx + r, 1), round(my, 1))
+            process_linear_element(arc.dxf.layer, length, mx, my, p1, p2)
+
+        # Processa LWPOLYLINE e POLYLINE
         for pline in msp.query("LWPOLYLINE"):
-            layer = pline.dxf.layer
-            layer_u = layer.upper()
-            if layer_u in IGNORED_LAYERS or any(k in layer_u for k in NON_PIPE_COMPONENT_LAYERS):
-                continue
-            if not any(k in layer_u for k in TRUE_PIPE_KEYWORDS):
-                continue
-
-            disc = identify_element_discipline(layer)
-            if disc == "GERAL":
-                continue
-
             pts = pline.get_points(format="xy")
             if len(pts) > 1:
-                mx, my = pts[0][0], pts[0][1]
-                if not is_master_fn(mx, my):
-                    continue
+                mx = sum(p[0] for p in pts) / len(pts)
+                my = sum(p[1] for p in pts) / len(pts)
+                plen = sum(math.hypot(pts[i][0] - pts[i-1][0], pts[i][1] - pts[i-1][1]) for i in range(1, len(pts)))
+                p1 = (round(pts[0][0], 1), round(pts[0][1], 1))
+                p2 = (round(pts[-1][0], 1), round(pts[-1][1], 1))
+                process_linear_element(pline.dxf.layer, plen, mx, my, p1, p2)
 
-                plen = sum(((pts[i][0]-pts[i-1][0])**2 + (pts[i][1]-pts[i-1][1])**2)**0.5 for i in range(1, len(pts)))
-                if plen > min_pipe_thresh:
-                    summary["disciplinas_detectadas"].add(disc)
-                    layer_lengths[layer] = layer_lengths.get(layer, 0.0) + plen
-                    d_found = find_nearest_diameter(mx, my) or "Ø A definir"
-                    canon_net = canonical_pipe_network(layer)
-                    pipe_key = f"{canon_net} - {d_found}"
-                    diam_pipe_lengths[pipe_key] = diam_pipe_lengths.get(pipe_key, 0.0) + plen
+        # Processa SPLINE (Eletrodutos flexíveis e leitos)
+        for spline in msp.query("SPLINE"):
+            pts = list(spline.fit_points) if len(spline.fit_points) > 1 else list(spline.control_points)
+            if len(pts) > 1:
+                mx = sum(p[0] for p in pts) / len(pts)
+                my = sum(p[1] for p in pts) / len(pts)
+                splen = sum(math.hypot(pts[i][0] - pts[i-1][0], pts[i][1] - pts[i-1][1]) for i in range(1, len(pts)))
+                p1 = (round(pts[0][0], 1), round(pts[0][1], 1))
+                p2 = (round(pts[-1][0], 1), round(pts[-1][1], 1))
+                process_linear_element(spline.dxf.layer, splen, mx, my, p1, p2)
 
+        # Consolidação Geral em Metros
         for k, total_raw in diam_pipe_lengths.items():
             summary["tubulacoes_por_diametro"][k] = round(total_raw / divisor, 2)
 
         for l, total_raw in layer_lengths.items():
             summary["metragens_lineares_metros"][l] = round(total_raw / divisor, 2)
 
-        summary["topologia_redes"] = sorted(linear_segments, key=lambda x: x["comprimento_m"], reverse=True)[:35]
+        # Consolidação por Pavimento em Metros
+        for vname, pdata in summary["detalhamento_por_pavimento"].items():
+            for pk, raw_v in pdata["tubulacoes_por_diametro"].items():
+                pdata["tubulacoes_por_diametro"][pk] = round(raw_v / divisor, 2)
 
-        # 3. CONSOLIDAÇÃO INTELIGENTE DE CONEXÕES E COMPONENTES (SEM DUPLICATAS DE CORTES)
+        summary["topologia_redes"] = sorted(linear_segments, key=lambda x: x["comprimento_m"], reverse=True)[:40]
+
+        # 3. CONSOLIDAÇÃO INTELIGENTE DE CONEXÕES, TOMADAS, INTERRUPTORES E EQUIPAMENTOS
         conn_consolidated = Counter()
         equipment_consolidated = Counter()
 
@@ -545,37 +742,53 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
             layer = ins.dxf.layer
             layer_u = layer.upper()
             bname = clean_block_name(ins.dxf.name)
+            bname_u = bname.upper()
 
-            # Se for layer 0, aceita apenas blocos com nomes de equipamentos reais
-            if layer_u == "0":
-                if is_anonymous_block(bname):
+            # Ignora blocos de carimbo, selo, arquitetura e xrefs
+            if any(k in bname_u for k in ["PAVTO", "ÁTICO", "ATICO", "ESQUADRIA", "MOBILIA", "FOLHA", "CARIMBO", "PLANTA"]):
+                continue
+
+            # Se for bloco anônimo, só aceita se a camada for comprovadamente de conexões industriais
+            if is_anonymous_block(bname):
+                if not any(k in layer_u for k in ["CONEXÃO", "CONEXAO", "VALV", "VÁLV", "FLANGE", "ACOPLAMENTO"]):
                     continue
-                if not any(k in bname.upper() for k in ["BOMBA", "VALV", "VÁLV", "CURVA", "TE", "FLANGE", "ADAPTADOR", "ACOPLAMENTO", "MOTOR", "PAINEL", "SUPORTE"]):
+
+            # Se for layer 0, aceita apenas blocos de engenharia reais
+            if layer_u == "0":
+                if not any(k in bname_u for k in ["BOMBA", "VALV", "VÁLV", "CURVA", "TE", "FLANGE", "ADAPTADOR", "ACOPLAMENTO", "MOTOR", "PAINEL", "SUPORTE", "LUM", "TOMADA", "INTERRUPTOR", "QUADRO"]):
                     continue
             elif layer_u in IGNORED_LAYERS or any(k in layer_u for k in ("CORTE", "SELO", "MARGEM", "FORMATO", "COTAS", "NIVEL", "EIXO")):
                 continue
 
             loc = ins.dxf.insert
-            # Desduplica componentes desenhados nas vistas de corte
-            if not is_master_fn(loc.x, loc.y):
-                continue
+            vtype, vname = classify_pt(loc.x, loc.y)
+            if vtype != "FLOOR":
+                continue  # Desduplica componentes desenhados nas vistas de corte ou legenda
 
             disc = identify_element_discipline(layer + " " + bname)
-
             if disc != "GERAL":
                 summary["disciplinas_detectadas"].add(disc)
-                
-                d_val = extract_diameter_from_string(bname)
-                if not d_val:
-                    d_val = find_nearest_diameter(loc.x, loc.y, max_dist=2500)
 
-                cat, desc_item, diam_nom = canonical_fitting_name(layer, bname, d_val)
+            d_val = extract_diameter_from_string(bname)
+            if not d_val:
+                d_val = find_nearest_diameter(loc.x, loc.y, max_dist=2500)
 
-                item_key = f"[{cat}] {desc_item}"
-                if any(k in cat for k in ["Conexão", "Acoplamento", "Flange", "Junta"]):
-                    conn_consolidated[item_key] += 1
-                else:
-                    equipment_consolidated[item_key] += 1
+            cat, desc_item, diam_nom = canonical_fitting_name(layer, bname, d_val)
+
+            # Evita blocos vazios ou genéricos sem classificação útil
+            if cat == "Acessório / Conexão" and is_anonymous_block(bname):
+                continue
+
+            item_key = f"[{cat}] {desc_item}"
+            if any(k in cat for k in ["Conexão", "Acoplamento", "Flange", "Junta"]):
+                conn_consolidated[item_key] += 1
+            else:
+                equipment_consolidated[item_key] += 1
+
+            # Atribuição ao Pavimento
+            if vname in summary["detalhamento_por_pavimento"]:
+                p_el = summary["detalhamento_por_pavimento"][vname]["elementos_pontuais"]
+                p_el[item_key] = p_el.get(item_key, 0) + 1
 
         summary["conexoes_e_acoplamentos"] = dict(conn_consolidated)
         combined_pts = dict(conn_consolidated)
@@ -598,104 +811,85 @@ def extract_project_summary(file_path: str, user_scale_override: str = None) -> 
 
         notes = []
         for layout in doc.layouts:
-            for ent in layout:
-                if ent.dxftype() in ("TEXT", "MTEXT"):
-                    raw = ent.dxf.text if ent.dxftype() == "TEXT" else ent.text
-                    txt = clean_cad_text(raw)
-                    if len(txt) > 20:
-                        upper = txt.upper()
-                        if any(w in upper for w in [
-                            "NORMA", "TESTE", "PRESSÃO", "NFPA", "NBR", "NOTA",
-                            "PROCEDIMENTO", "REFERENCIA", "MATERIAL", "ESPECIFICAÇÃO"
-                        ]):
-                            if txt not in notes: notes.append(txt)
+            if layout.name != "Model":
+                for ent in layout:
+                    if ent.dxftype() in ("TEXT", "MTEXT"):
+                        raw = ent.dxf.text if ent.dxftype() == "TEXT" else ent.text
+                        t = clean_cad_text(raw)
+                        if t and len(t) > 15 and not any(k in t.upper() for k in ["DWG", "AUTOCAD", "REV"]):
+                            notes.append(t)
+        summary["notas_de_prancha"] = list(set(notes))[:20]
 
-        summary["notas_de_prancha"] = notes[:25]
         summary["disciplinas_detectadas"] = list(summary["disciplinas_detectadas"])
+        if not summary["disciplinas_detectadas"]:
+            summary["disciplinas_detectadas"] = ["ENGENHARIA_GERAL"]
 
         return summary
+
     finally:
         if temp_created and os.path.exists(dxf_path):
             try:
                 os.remove(dxf_path)
-            except:
+            except Exception:
                 pass
 
-def format_ai_prompt(data: dict) -> str:
-    p = []
-    p.append("="*80)
-    p.append("AUDITORIA TÉCNICA MULTIDISCIPLINAR DE PROJETO (IA READY)")
-    p.append(f"Arquivo: {data['arquivo']}")
-    disc_str = ", ".join(data['disciplinas_detectadas']) if data['disciplinas_detectadas'] else "Geral / Engenharia"
-    p.append(f"Disciplinas: {disc_str}")
-    esc = data.get("auditoria_escala", {})
-    p.append(f"Calibração de Escala: {esc.get('unidade_detectada', 'N/D')} (Divisor {esc.get('divisor_aplicado', 1000)})")
-    
-    vistas = data.get("auditoria_vistas", {})
-    if vistas.get("possui_planta_e_corte"):
-        p.append("Desduplicação de Vistas: ATIVADA (Planta Baixa auditada para evitar duplicações dos Cortes)")
-    p.append("="*80)
+def format_ai_prompt(summary: dict) -> str:
+    lines = []
+    lines.append(f"# RELATÓRIO TÉCNICO DE AUDITORIA E EXTRAÇÃO CAD")
+    lines.append(f"**Arquivo Analisado:** {summary['arquivo']}")
+    lines.append(f"**Disciplinas Identificadas:** {', '.join(summary['disciplinas_detectadas'])}")
+    lines.append(f"**Auditoria de Escala:** {summary['auditoria_escala']['unidade_detectada']} (Fator de Conversão: divide por {summary['auditoria_escala']['divisor_aplicado']} para metros)")
+    lines.append(f"**Detecção de Vistas & Pavimentos:** {summary['auditoria_vistas']['mensagem']}")
+    lines.append("")
 
-    p.append("\n[AVERIGUAÇÃO DA ESCALA E MEDIDAS DO PROJETO]:")
-    p.append(f"  ℹ️  {esc.get('explicacao_tecnica', '')}")
-    if esc.get("cotas_amostra_para_conferencia"):
-        p.append("  Amostra de Cotas no Arquivo para conferência no CAD (Comando DIST):")
-        for s in esc["cotas_amostra_para_conferencia"][:4]:
-            val_m = s['valor_cad'] / esc.get('divisor_aplicado', 1000)
-            p.append(f"   • Cota Layer [{s['layer']}]: {s['valor_cad']:.1f} unidades CAD = {val_m:.2f} metros reais")
+    # Detalhamento por Pavimento (se houver mais de 1)
+    if summary["auditoria_vistas"].get("possui_multi_pavimentos"):
+        lines.append("## 🏢 QUANTITATIVOS SEGREGAÇÃO POR PAVIMENTO")
+        for pav_name, pav_data in summary.get("detalhamento_por_pavimento", {}).items():
+            lines.append(f"### 📍 {pav_name.upper()}")
+            tubos = pav_data.get("tubulacoes_por_diametro", {})
+            if tubos:
+                lines.append("  *Tubulações e Eletrodutos:*")
+                for tk, metros in sorted(tubos.items()):
+                    lines.append(f"    - {tk}: **{metros:.2f} m**")
+            pontos = pav_data.get("elementos_pontuais", {})
+            if pontos:
+                lines.append("  *Aparelhos, Conexões e Equipamentos:*")
+                for pk, qtd in sorted(pontos.items()):
+                    lines.append(f"    - {pk}: **{qtd} un**")
+            lines.append("")
 
-    if vistas.get("possui_planta_e_corte"):
-        p.append("\n[DESDUPLICAÇÃO DE VISTAS (PLANTA vs CORTE)]:")
-        p.append(f"  ℹ️  {vistas.get('mensagem')}")
+    # Quantitativos Globais
+    lines.append("## 📦 QUANTITATIVO GERAL DE MATERIAIS CONSOLIDADOS")
+    lines.append("### 1. Tubulações e Eletrodutos por Diâmetro")
+    if summary["tubulacoes_por_diametro"]:
+        for item, metros in sorted(summary["tubulacoes_por_diametro"].items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"- **{item}**: {metros:.2f} metros")
+    else:
+        lines.append("*(Nenhuma rede linear física identificada)*")
 
-    if data["inconsistencias"]:
-        p.append("\n[ALERTAS DE INCONSISTÊNCIAS]:")
-        for inc in data["inconsistencias"]:
-            p.append(f"  ⚠️  [{inc['gravidade']} - {inc['tipo']}]: {inc['mensagem']}")
+    lines.append("")
+    lines.append("### 2. Conexões, Válvulas, Tomadas e Equipamentos")
+    if summary["elementos_pontuais"]:
+        for item, qtd in sorted(summary["elementos_pontuais"].items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"- **{item}**: {qtd} unidades")
+    else:
+        lines.append("*(Nenhum componente pontual identificado)*")
 
-    p.append("\n1. TUBULAÇÕES REAIS POR DIÂMETRO (METRAGEM AUDITADA):")
-    if data.get("tubulacoes_por_diametro"):
-        for pipe, met in sorted(data["tubulacoes_por_diametro"].items(), key=lambda x: x[1], reverse=True):
-            p.append(f"  • {pipe}: {met:.2f} metros")
+    lines.append("")
+    lines.append("---")
+    lines.append("*Extração processada deterministicamente sem duplicações de cortes ou vistas auxiliares.*")
+    return "\n".join(lines)
 
-    p.append("\n2. CONEXÕES, FLANGES E ACOPLAMENTOS (CONSOLIDADOS SEM DUPLICATAS):")
-    if data.get("conexoes_e_acoplamentos"):
-        for conn, qtd in sorted(data["conexoes_e_acoplamentos"].items(), key=lambda x: x[1], reverse=True):
-            p.append(f"  • {conn}: {qtd} un")
-
-    p.append("\n3. VÁLVULAS, EQUIPAMENTOS E SUPORTES:")
-    other_items = {k: v for k, v in data["elementos_pontuais"].items() if k not in data.get("conexoes_e_acoplamentos", {})}
-    for it, qtd in sorted(other_items.items(), key=lambda x: x[1], reverse=True):
-        p.append(f"  • {it}: {qtd} un")
-
-    if data["notas_de_prancha"]:
-        p.append("\n4. NOTAS GERAIS E NORMAS DE PROJETO:")
-        for n in data["notas_de_prancha"]:
-            p.append(f"  [NOTA]: {n}")
-
-    p.append("\n" + "="*80)
-    return "\n".join(p)
-
-def format_topology_text(data: dict) -> str:
-    t = []
-    t.append("="*80)
-    t.append(f"MAPA TOPOLÓGICO & COORDENADAS REAIS PARA AUDITORIA (CAD-AS-CODE)")
-    t.append(f"Arquivo: {data['arquivo']}")
-    esc = data.get("auditoria_escala", {})
-    t.append(f"Escala Aplicada: {esc.get('unidade_detectada')} (1 metro = {esc.get('divisor_aplicado')} unidades CAD)")
-    t.append("="*80)
-    t.append("\nTRECHOS AUDITADOS COM COORDENADAS PARA CONFERÊNCIA NO AUTOCAD (COMANDO 'DIST'):")
-
-    if data.get("topologia_redes"):
-        for i, seg in enumerate(data["topologia_redes"], 1):
-            p_ini = f"({seg['inicio'][0]}, {seg['inicio'][1]})"
-            p_fim = f"({seg['fim'][0]}, {seg['fim'][1]})"
-            diam_txt = f" | Diâmetro: {seg.get('diametro', 'N/D')}"
-            t.append(f"  [TRECHO #{i:02d}] {seg.get('rede', seg['layer'])}{diam_txt}")
-            t.append(f"    Comprimento Auditado: {seg['comprimento_m']} metros  (Geometria CAD: {seg.get('comprimento_cad_original')} unidades)")
-            t.append(f"    Coordenadas: Início em {p_ini}  ──▶  Fim em {p_fim}")
-    t.append("\n" + "="*80)
-    return "\n".join(t)
+def format_topology_text(summary: dict) -> str:
+    lines = []
+    lines.append("# TOPOLOGIA CAD-AS-CODE - MAPEAMENTO DE TRECHOS REAIS")
+    lines.append(f"Arquivo: {summary['arquivo']} | Escala: {summary['auditoria_escala']['unidade_detectada']}")
+    lines.append("")
+    for seg in summary.get("topologia_redes", []):
+        pav_str = f" [{seg['pavimento']}]" if "pavimento" in seg else ""
+        lines.append(f"- Rede: {seg['rede']}{pav_str} | Diâmetro: {seg['diametro']} | Comp: {seg['comprimento_m']} m (CAD: {seg['comprimento_cad_original']}) | Início: {seg['inicio']} -> Fim: {seg['fim']}")
+    return "\n".join(lines)
 
 def main():
     if len(sys.argv) < 2:
